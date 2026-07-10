@@ -1,0 +1,121 @@
+name: cortex-m7
+display_name: ARM Cortex-M7
+architecture: armv7e-m
+vendor: ARM
+family: Cortex-M
+version: "1.0.0"
+description: Hardware profile for ARM Cortex-M7 core optimized for high-performance MCU use
+
+cpu:
+  core: Cortex-M7
+  arch: ARMv7E-M
+  isa: thumb2
+  endianness: little
+  word_size: 32
+
+clock:
+  frequency_mhz: 400
+  description: Typical max frequency, tunable per board (STM32F7/H7 up to 480 MHz)
+
+pipeline:
+  stages: 6
+  superscalar: true
+  dual_issue: true
+  branch_prediction: true
+  branch_predictor: "dynamic"
+
+fpu:
+  present: true
+  variant: fpv5-sp-d16
+  single_precision: true
+  double_precision: true
+  sp_only: false
+  num_sp_registers: 32
+
+dsp:
+  present: true
+  extension: ARMv7E-M DSP
+  instructions:
+    - SMLAD
+    - SMLALD
+    - SMUAD
+    - SADD16
+    - QADD
+    - SSAT
+    - USAT
+  simd_width_bits: 32
+
+mve:
+  note: Cortex-M7 does NOT have Helium MVE - listed for forward compatibility and error checking
+  present: false
+  variant: null
+  helim: false
+
+memory:
+  itcm:
+    size_kb: 16
+    description: Instruction Tightly Coupled Memory
+  dtcm:
+    size_kb: 16
+    description: Data Tightly Coupled Memory
+  icache:
+    size_kb: 16
+    associativity: 2
+    line_size_bytes: 32
+  dcache:
+    size_kb: 16
+    associativity: 4
+    line_size_bytes: 32
+  flash:
+    size_kb: 2048
+  sram:
+    size_kb: 512
+  max_code_size_kb: 256
+  max_stack_size_kb: 8
+
+constraints:
+  max_code_size_bytes: 262144
+  max_stack_bytes: 8192
+  require_thumb2: true
+  alignment: 4
+  avoid_unaligned_access: false
+  allow_double_precision: true
+
+toolchain:
+  compiler: arm-none-eabi-gcc
+  version_constraint: ">=10.0.0"
+  flags:
+    arch: -mcpu=cortex-m7
+    fpu: -mfpu=fpv5-sp-d16
+    float_abi: -mfloat-abi=hard
+    thumb: -mthumb
+    optimize_default: -O2
+    optimize_speed: -O3
+    optimize_size: -Os
+  linker:
+    spec: nosys.specs
+    extra_flags: [-Wl,--gc-sections]
+
+emulation:
+  qemu_user: qemu-arm
+  qemu_system: qemu-system-arm
+  qemu_machine: mps2-an500
+  qemu_cpu: cortex-m7
+  supports_semihosting: true
+
+benchmark:
+  method: qemu_cycle_estimate
+  host_tool: qemu-system-arm
+  cycle_counter: DWT_CYCCNT
+
+codegen:
+  preferred_intrinsics: []
+  allow_inline_asm: true
+  loop_unroll_factors: [2, 4, 8]
+  vectorization: false
+
+metadata:
+  reference_boards: [STM32F746G-DISCO, STM32H743ZI, NXP i.MX RT1050]
+  author: kernelsmith
+  created: "2024-01-01"
+  tags: [cortex-m, armv7e-m, mcu, fpu, dsp]

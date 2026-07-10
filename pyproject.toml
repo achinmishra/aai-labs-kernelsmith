@@ -1,0 +1,66 @@
+[project]
+name = "kernelsmith"
+version = "0.1.0"
+description = "CLI tool that generates optimized C code for ARM Cortex-M7"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "kernelsmith" },
+]
+keywords = ["arm", "cortex-m7", "codegen", "optimized", "embedded"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Code Generators",
+]
+
+dependencies = [
+    "click==8.1.8",
+    "pyyaml==6.0.2",
+    "numpy==1.26.4",
+    "jinja2==3.1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "ruff==0.9.6",
+    "pre-commit==4.0.1",
+]
+
+[project.scripts]
+kernelsmith = "kernelsmith.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/codimango/aai-labs-kernelsmith"
+Repository = "https://github.com/codimango/aai-labs-kernelsmith"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kernelsmith*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

@@ -1,0 +1,76 @@
+name: relu
+op_type: relu
+description: Rectified Linear Unit activation - element-wise max(0, x)
+version: "1.0.0"
+domain: "activation"
+category: "elementwise"
+
+inputs:
+  - name: input
+    dtype: float32
+    shape: [batch, channels, height, width]
+    description: Input tensor with arbitrary shape
+    constraints:
+      - dtype in [float32, float16, int8, int16]
+      - rank >= 1
+
+outputs:
+  - name: output
+    dtype: float32
+    shape: [batch, channels, height, width]
+    description: Output tensor, same shape as input, negative values clamped to 0
+
+attributes: {}
+
+math:
+  formula: "output[i] = max(0, input[i])"
+  properties:
+    - monotonic: true
+    - non-linear: true
+    - saturates_negative: true
+
+implementation_hints:
+  cortex_m7:
+    notes:
+      - Use conditional select via VSEL or branchless max
+      - Exploit DSP extension SMLAD not applicable, but SIMD via MVE may help for float16/int8
+      - Consider FPU VMAXNM.F32 for float32
+      - For quantized int8 SSAT and USAT or simple max with 0 using CMP and conditional move
+    optimizations:
+      loop_unrolling: 4
+      simd_width: 4
+      use_fpu: true
+      use_dsp: false
+      use_mve: true
+      in_place_allowed: true
+
+reference:
+  c_file: reference/naive/relu.c
+  function: relu_f32
+
+test_vectors:
+  generate:
+    method: random_normal
+    dtype: float32
+    shapes:
+      - [1, 3, 32, 32]
+      - [1, 16]
+      - [8, 128]
+    seed: 42
+  edge_cases:
+    - zeros
+    - all_negative
+    - all_positive
+    - mixed
+    - large_values
+    - denormals
+
+performance:
+  metrics: [latency_cycles, throughput, code_size, stack_usage]
+  baseline: reference/naive/relu.c
+  target_hardware: examples/hardware/cortex-m7.yaml
+
+metadata:
+  author: kernelsmith
+  created: "2024-01-01"
+  tags: [activation, relu, elementwise, quantized-friendly]
