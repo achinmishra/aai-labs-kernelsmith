@@ -192,9 +192,13 @@ class AvocadoProvider(LLMProvider):
                         top_p=1.0,
                     )
                 text = self._extract_text(response)
-                if text:
-                    return text
-                raise RuntimeError("Empty response from LLM")
+                if text and text.strip():
+                    return text.strip()
+                raw_preview = str(response)[:2000]
+                raise RuntimeError(
+                    f"Empty response from LLM (model {self.model} at {self.base_url}). "
+                    f"Raw preview: {raw_preview[:500]}"
+                )
             except Exception as exc:
                 err_str = str(exc).lower()
                 if (
@@ -227,27 +231,46 @@ class AvocadoProvider(LLMProvider):
     @staticmethod
     def _extract_text(response) -> str:
         if hasattr(response, "output_text") and response.output_text:
-            return response.output_text
+            txt = response.output_text
+            if txt and txt.strip():
+                return txt
         if hasattr(response, "output"):
             parts = []
             for item in getattr(response, "output", []):
                 if hasattr(item, "content"):
                     for c in item.content:
-                        if hasattr(c, "text"):
+                        if hasattr(c, "text") and c.text:
                             parts.append(c.text)
-                        elif hasattr(c, "output_text"):
+                        elif hasattr(c, "output_text") and c.output_text:
                             parts.append(c.output_text)
             if parts:
-                return "\n".join(parts)
+                joined = "\n".join(parts)
+                if joined.strip():
+                    return joined
         if hasattr(response, "choices") and response.choices:
             first = response.choices[0]
-            if hasattr(first, "message") and hasattr(first.message, "content"):
-                return first.message.content or ""
-            if hasattr(first, "text"):
-                return first.text or ""
-        if hasattr(response, "content"):
-            return response.content or ""
-        return str(response)
+            if hasattr(first, "message"):
+                msg = first.message
+                if hasattr(msg, "content") and msg.content:
+                    c = msg.content
+                    if isinstance(c, str) and c.strip():
+                        return c
+                    if isinstance(c, list):
+                        texts = []
+                        for part in c:
+                            if isinstance(part, dict) and "text" in part:
+                                texts.append(part["text"])
+                            elif hasattr(part, "text"):
+                                texts.append(part.text)
+                        if texts:
+                            return "\n".join(texts)
+                if hasattr(msg, "refusal") and msg.refusal:
+                    return f"Refusal: {msg.refusal}"
+            if hasattr(first, "text") and first.text:
+                return first.text
+        if hasattr(response, "content") and response.content:
+            return response.content
+        return ""
 
 
 def get_provider(name: str = "mock", **kwargs) -> LLMProvider:
