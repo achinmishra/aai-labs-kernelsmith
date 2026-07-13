@@ -121,7 +121,29 @@ class AvocadoProvider(LLMProvider):
                 "openai package not installed. Install with: pip install openai==1.30.5"
             ) from e
 
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]:
+            os.environ.pop(k, None)
+
+        try:
+            import httpx
+
+            http_client = httpx.Client(trust_env=False, timeout=self.timeout)
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                http_client=http_client,
+            )
+        except Exception:
+            client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
