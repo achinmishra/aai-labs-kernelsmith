@@ -90,7 +90,7 @@ class AvocadoProvider(LLMProvider):
     MODEL = "avocado_metacode_rc"
     EXPERIMENTAL_MODEL = "avocado_metacode_rc"
     ENV_VAR = "KERNELSMITH_MODEL_API_KEY"
-    ENV_VAR_EXPERIMENTAL = "LLAMA_API_KEY"
+    ENV_VAR_EXPERIMENTAL = "KERNELSMITH_MODEL_API_KEY"
     BASE_URL = "https://api.ai.meta.com/v1"
     EXPERIMENTAL_BASE_URL = "https://api.llama.com/experimental/compat/openai/v1"
 
@@ -110,7 +110,10 @@ class AvocadoProvider(LLMProvider):
             self.api_key = (
                 api_key or os.getenv(self.ENV_VAR) or os.getenv(self.ENV_VAR_EXPERIMENTAL)
             )
-            env_hint = f"{self.ENV_VAR} or {self.ENV_VAR_EXPERIMENTAL}"
+            if self.ENV_VAR == self.ENV_VAR_EXPERIMENTAL:
+                env_hint = self.ENV_VAR
+            else:
+                env_hint = f"{self.ENV_VAR} or {self.ENV_VAR_EXPERIMENTAL}"
             default_model = self.EXPERIMENTAL_MODEL
             default_base = self.EXPERIMENTAL_BASE_URL
         else:
