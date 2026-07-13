@@ -148,13 +148,22 @@ class AvocadoProvider(LLMProvider):
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                response = client.responses.create(
-                    model=self.model,
-                    input=prompt,
-                    max_output_tokens=4096,
-                    temperature=1.0,
-                    top_p=1.0,
-                )
+                if hasattr(client, "responses"):
+                    response = client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        max_output_tokens=4096,
+                        temperature=1.0,
+                        top_p=1.0,
+                    )
+                else:
+                    response = client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=4096,
+                        temperature=1.0,
+                        top_p=1.0,
+                    )
                 text = self._extract_text(response)
                 if text:
                     return text
@@ -169,7 +178,7 @@ class AvocadoProvider(LLMProvider):
 
     @staticmethod
     def _extract_text(response) -> str:
-        if hasattr(response, "output_text"):
+        if hasattr(response, "output_text") and response.output_text:
             return response.output_text
         if hasattr(response, "output"):
             parts = []
@@ -182,6 +191,14 @@ class AvocadoProvider(LLMProvider):
                             parts.append(c.output_text)
             if parts:
                 return "\n".join(parts)
+        if hasattr(response, "choices") and response.choices:
+            first = response.choices[0]
+            if hasattr(first, "message") and hasattr(first.message, "content"):
+                return first.message.content or ""
+            if hasattr(first, "text"):
+                return first.text or ""
+        if hasattr(response, "content"):
+            return response.content or ""
         return str(response)
 
 
