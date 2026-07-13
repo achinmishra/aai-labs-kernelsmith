@@ -117,6 +117,9 @@ Explain in markdown:
 - Target specifics
 ## Trade-offs
 - Code size vs speed, etc.
+## Expected Execution
+- After this reasoning and optimization, what is the expectation on code execution: estimated cycles, throughput, stack usage, correctness, and observable behavior (e.g., handles tail, in-place safe, no branching stalls)
+- Mention expected speedup vs naive reference and conditions under which it holds (e.g., length % 4, alignment, dtype)
 ## Inputs Used
 - Operator spec: operators/{{ operator.name }}.yaml
 - Hardware profile: hardware_profiles/{{ target.name }}.yaml

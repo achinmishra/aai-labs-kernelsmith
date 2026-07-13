@@ -60,6 +60,15 @@ void ks_relu_cortex_m7(const float* input, float* output, int length) {
 - Code size increased ~40 bytes due to unrolling: acceptable within 256KB code budget
 - Unrolled loop requires tail handling
 
+## Expected Execution
+- After this reasoning and optimization, expected execution:
+  ~25% fewer cycles vs naive due to reduced branches and dual-issue;
+  throughput improves for length >=16; stack <32 bytes (no alloc, only counters);
+  correctness preserved for zeros, negatives, mixed edge cases;
+  handles tail when length %4 !=0; in-place safe.
+  Speedup holds when input aligned to 4 bytes and length >=4;
+  fallback tail ensures correctness otherwise.
+
 ## Inputs Used
 - Operator spec: operators/relu.yaml
 - Hardware profile: hardware_profiles/cortex_m7.yaml
