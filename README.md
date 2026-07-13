@@ -111,46 +111,59 @@ pytest -v
 
 KernelSmith uses Meta's Avocado / Muse Spark to generate optimized kernels.
 
-**Model:** `avocado_metacode_rc`
+**Prod:**
+- Model: `avocado_metacode_rc`
+- Env var: `KERNELSMITH_MODEL_API_KEY`
+- Base URL: `https://api.ai.meta.com/v1`
 
-**Env var:** `KERNELSMITH_MODEL_API_KEY` (was `MODEL_API_KEY`, now namespaced for kernelsmith)
+**Experimental / Dev (works with curl you tested):**
+- Model: `aws-claude-4-8-opus-aai` (or other experimental)
+- Env var: `LLAMA_API_KEY` (fallback to `KERNELSMITH_MODEL_API_KEY`)
+- Base URL: `https://api.llama.com/experimental/compat/openai/v1`
+- Flag: `--dev` / `--experimental`
 
 ### Setup
 
-Add the API key to your OS environment:
-
-**Linux / macOS (bash/zsh):**
+**Prod key:**
 ```bash
 export KERNELSMITH_MODEL_API_KEY="your_api_key_here"
-# Persist in shell rc:
 echo 'export KERNELSMITH_MODEL_API_KEY="your_api_key_here"' >> ~/.zshrc
-# or ~/.bashrc
 ```
 
-**Windows (PowerShell):**
-```powershell
-$env:KERNELSMITH_MODEL_API_KEY="your_api_key_here"
-# Persist:
-setx KERNELSMITH_MODEL_API_KEY "your_api_key_here"
-```
-
-**Via .env file (with python-dotenv):**
+**Experimental key (for --dev):**
 ```bash
-# .env in repo root (gitignored)
-KERNELSMITH_MODEL_API_KEY=your_api_key_here
+export LLAMA_API_KEY="your_llama_key"
+# or fallback to KERNELSMITH key:
+export KERNELSMITH_MODEL_API_KEY="..."
+```
+
+**Via .env:**
+```bash
+KERNELSMITH_MODEL_API_KEY=...
+LLAMA_API_KEY=...
 ```
 
 **Verify:**
 ```bash
-echo $KERNELSMITH_MODEL_API_KEY  # should print key
-python -c "import os; print('set' if os.getenv('KERNELSMITH_MODEL_API_KEY') else 'NOT SET')"
+echo $KERNELSMITH_MODEL_API_KEY
+python -c "import os; print('prod' if os.getenv('KERNELSMITH_MODEL_API_KEY') else 'MISSING')"
+echo $LLAMA_API_KEY
 ```
 
-**Usage with generate command (once implemented):**
+**Usage:**
 ```bash
-kernelsmith generate relu --target cortex-m7 --output-dir ./output/
-# Uses model avocado_metacode_rc at https://api.ai.meta.com/v1
-# If key missing, CLI will error: "KERNELSMITH_MODEL_API_KEY not set – see README"
+# Prod (default avocado provider, model avocado_metacode_rc)
+kernelsmith optimize relu --target cortex-m7 -o ./output/
+
+# Explicit mock (offline, no key needed)
+kernelsmith optimize relu --target cortex-m7 --llm-provider mock -o ./output/
+
+# Dev / experimental (uses LLAMA_API_KEY and experimental endpoint)
+kernelsmith optimize relu --target cortex-m7 --dev -o ./output/
+kernelsmith optimize relu --target cortex-m7 --dev --model aws-claude-4-8-opus-aai -o ./output/
+
+# Custom model
+kernelsmith optimize relu --target cortex-m7 --model <available-model> -o ./output/
 ```
 
 For CI/tests, mock provider is used so no key needed.
@@ -159,9 +172,8 @@ For CI/tests, mock provider is used so no key needed.
 
 Pinned with `==`:
 
-- prod: `click==8.1.8`, `pyyaml==6.0.2`, `numpy==1.26.4`, `jinja2==3.1.5`
+- prod: `click==8.1.8`, `pyyaml==6.0.2`, `numpy==1.26.4`, `jinja2==3.1.5`, `pydantic==2.8.2`, `openai==1.40.2`, `httpx==0.27.0`
 - dev: `pytest==8.3.4`, `ruff==0.9.6`, `pre-commit==4.0.1`
-- future: `pydantic==2.8.2`, `openai==1.30.5` (for Avocado client)
 
 ## Examples
 

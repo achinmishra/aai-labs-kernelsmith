@@ -88,8 +88,11 @@ class MockProvider(LLMProvider):
 
 class AvocadoProvider(LLMProvider):
     MODEL = "avocado_metacode_rc"
+    EXPERIMENTAL_MODEL = "aws-claude-4-8-opus-aai"
     ENV_VAR = "KERNELSMITH_MODEL_API_KEY"
+    ENV_VAR_EXPERIMENTAL = "LLAMA_API_KEY"
     BASE_URL = "https://api.ai.meta.com/v1"
+    EXPERIMENTAL_BASE_URL = "https://api.llama.com/experimental/compat/openai/v1"
 
     def __init__(
         self,
@@ -98,18 +101,38 @@ class AvocadoProvider(LLMProvider):
         base_url: str | None = None,
         max_retries: int = 3,
         timeout: float = 60.0,
+        experimental: bool = False,
+        dev: bool = False,
     ):
-        self.api_key = api_key or os.getenv(self.ENV_VAR)
+        self.experimental = experimental or dev
+
+        if self.experimental:
+            self.api_key = (
+                api_key or os.getenv(self.ENV_VAR_EXPERIMENTAL) or os.getenv(self.ENV_VAR)
+            )
+            env_hint = f"{self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}"
+            default_model = self.EXPERIMENTAL_MODEL
+            default_base = self.EXPERIMENTAL_BASE_URL
+        else:
+            self.api_key = api_key or os.getenv(self.ENV_VAR)
+            env_hint = self.ENV_VAR
+            default_model = self.MODEL
+            default_base = self.BASE_URL
+
         if not self.api_key:
+            primary_env = env_hint.split(" or ")[0]
             raise RuntimeError(
-                f"{self.ENV_VAR} not set. "
+                f"{env_hint} not set. "
                 f"Add it to your OS environment: "
-                f'export {self.ENV_VAR}="your_key" (bash/zsh) or '
-                f'setx {self.ENV_VAR} "your_key" (Windows). '
+                f'export {primary_env}="your_key" (bash/zsh) or '
+                f'setx {primary_env} "your_key" (Windows). '
+                f"For dev, set {self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}. "
                 f"See README.md LLM Configuration."
             )
-        self.model = model or self.MODEL
-        self.base_url = base_url or self.BASE_URL
+        self.model = model or default_model
+        if self.experimental and model is None:
+            self.model = default_model
+        self.base_url = base_url or default_base
         self.max_retries = max_retries
         self.timeout = timeout
 
@@ -184,8 +207,10 @@ class AvocadoProvider(LLMProvider):
                     raise RuntimeError(
                         f"Model '{self.model}' not found at {self.base_url}. "
                         f"Available (first 20): {avail_str}. "
-                        f"Try --model <available> or check KERNELSMITH_MODEL_API_KEY "
-                        f"and base_url https://api.ai.meta.com/v1. "
+                        f"Try --model <available> or check {self.ENV_VAR} / "
+                        f"{self.ENV_VAR_EXPERIMENTAL} and base_url. "
+                        f"For dev: --dev uses {self.EXPERIMENTAL_BASE_URL} "
+                        f"with model {self.EXPERIMENTAL_MODEL}. "
                         f"Original error: {exc}"
                     ) from exc
                 last_exc = exc

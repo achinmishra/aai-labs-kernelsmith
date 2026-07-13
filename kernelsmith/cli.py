@@ -44,17 +44,12 @@ def main() -> None:
 )
 @click.option(
     "--llm-provider",
+    "--provider",
     "llm_provider",
     type=click.Choice(["mock", "avocado"]),
     default="avocado",
     show_default=True,
     help="LLM provider: avocado=API (needs KERNELSMITH_MODEL_API_KEY), mock=offline.",
-)
-@click.option(
-    "--provider",
-    "llm_provider",
-    type=click.Choice(["mock", "avocado"]),
-    hidden=True,
 )
 @click.option(
     "--template",
@@ -65,9 +60,16 @@ def main() -> None:
 @click.option(
     "--model",
     type=str,
-    default="avocado_metacode_rc",
-    show_default=True,
-    help="Model name for Avocado LLM.",
+    default=None,
+    help="Model name. Prod default avocado_metacode_rc, dev default aws-claude-4-8-opus-aai.",
+)
+@click.option(
+    "--dev",
+    "--experimental",
+    "dev",
+    is_flag=True,
+    default=False,
+    help="Use experimental endpoint (api.llama.com) with LLAMA_API_KEY.",
 )
 def optimize_cmd(
     operator: str,
@@ -76,7 +78,8 @@ def optimize_cmd(
     output_dir: pathlib.Path,
     llm_provider: str,
     template: pathlib.Path | None,
-    model: str,
+    model: str | None,
+    dev: bool,
 ) -> None:
     """Generate optimized C kernel for OPERATOR and target.
 
@@ -84,6 +87,9 @@ def optimize_cmd(
     """
     operator = operator.lower()
     target_name = target_name.lower()
+    effective_model = model
+    if effective_model is None:
+        effective_model = "aws-claude-4-8-opus-aai" if dev else "avocado_metacode_rc"
     try:
         result = optimize_fn(
             operator=operator,
@@ -92,7 +98,8 @@ def optimize_cmd(
             output_dir=output_dir,
             llm_provider_name=llm_provider,
             template_path=template,
-            model=model,
+            model=effective_model,
+            dev=dev,
         )
         click.echo(f"Generated files for {operator} ({target_name}):")
         click.echo(f"  Header: {result.files.header_path}")
@@ -140,17 +147,12 @@ def optimize_cmd(
 )
 @click.option(
     "--llm-provider",
+    "--provider",
     "llm_provider",
     type=click.Choice(["mock", "avocado"]),
     default="avocado",
     show_default=True,
-    help="LLM provider.",
-)
-@click.option(
-    "--provider",
-    "llm_provider",
-    type=click.Choice(["mock", "avocado"]),
-    hidden=True,
+    help="LLM provider: avocado=API, mock=offline.",
 )
 @click.option(
     "--template",
@@ -161,9 +163,16 @@ def optimize_cmd(
 @click.option(
     "--model",
     type=str,
-    default="avocado_metacode_rc",
-    show_default=True,
-    help="Model name.",
+    default=None,
+    help="Model name. Prod default avocado_metacode_rc, dev default aws-claude-4-8-opus-aai.",
+)
+@click.option(
+    "--dev",
+    "--experimental",
+    "dev",
+    is_flag=True,
+    default=False,
+    help="Use experimental endpoint (api.llama.com) with LLAMA_API_KEY.",
 )
 def generate_cmd(
     operator: str,
@@ -172,7 +181,8 @@ def generate_cmd(
     output_dir: pathlib.Path,
     llm_provider: str,
     template: pathlib.Path | None,
-    model: str,
+    model: str | None,
+    dev: bool,
 ) -> None:
     """Alias for optimize (kept for backward compat with brief doc)."""
     click.echo("Note: `generate` is alias for `optimize`, prefer `optimize`")
@@ -186,6 +196,7 @@ def generate_cmd(
         llm_provider=llm_provider,
         template=template,
         model=model,
+        dev=dev,
     )
 
 

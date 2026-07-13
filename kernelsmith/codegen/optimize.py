@@ -25,16 +25,27 @@ def optimize(
     template_path: pathlib.Path | None = None,
     model: str = "avocado_metacode_rc",
     provider_name: str | None = None,
+    experimental: bool = False,
+    dev: bool = False,
 ) -> OptimizeResult:
     if provider_name is not None and llm_provider_name == "avocado":
         llm_provider_name = provider_name
+
+    is_experimental = experimental or dev
+
+    if model is None:
+        model = "aws-claude-4-8-opus-aai" if is_experimental else "avocado_metacode_rc"
+    elif is_experimental and model == "avocado_metacode_rc":
+        model = "aws-claude-4-8-opus-aai"
 
     operator_path = resolve_operator_spec(operator, custom_spec=spec_path)
     target_path = resolve_hardware_profile(target)
 
     prompt = build_prompt(operator_path, target_path, template_path=template_path)
 
-    provider: LLMProvider = get_provider(llm_provider_name, model=model)
+    provider: LLMProvider = get_provider(
+        llm_provider_name, model=model, experimental=is_experimental
+    )
 
     raw_response = provider.generate(prompt)
 
