@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "CLI tool that generates optimized C code for ARM Cortex-M7"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Proprietary – Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved." }
 authors = [
-    { name = "kernelsmith" },
+    { name = "Meta Platforms, Inc." },
 ]
 keywords = ["arm", "cortex-m7", "codegen", "optimized", "embedded"]
 classifiers = [
@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Code Generators",
 ]

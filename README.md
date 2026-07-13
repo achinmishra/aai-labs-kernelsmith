@@ -171,4 +171,5 @@ Pinned with `==`:
 
 ## License
 
-MIT
+Proprietary – Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
+See LICENSE file.
