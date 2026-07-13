@@ -49,7 +49,7 @@ def main() -> None:
     type=click.Choice(["mock", "avocado", "avocado_free"]),
     default="avocado_free",
     show_default=True,
-    help="LLM provider: avocado_free=free (LLAMA_API_KEY, default), avocado=prod, mock=offline.",
+    help="LLM provider: avocado_free=free (default), avocado=prod soon, mock=offline.",
 )
 @click.option(
     "--template",
@@ -153,7 +153,7 @@ def optimize_cmd(
     type=click.Choice(["mock", "avocado", "avocado_free"]),
     default="avocado_free",
     show_default=True,
-    help="LLM provider: avocado_free=free (LLAMA_API_KEY, default), avocado=prod, mock=offline.",
+    help="LLM provider: avocado_free=free (default), avocado=prod soon, mock=offline.",
 )
 @click.option(
     "--template",

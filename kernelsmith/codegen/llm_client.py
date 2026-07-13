@@ -108,7 +108,29 @@ class AvocadoProvider(LLMProvider):
 
         if self.experimental:
             self.api_key = (
-                api_key or os.getenv(self.ENV_VAR_EXPERIMENTAL) or os.getenv(self.ENV_VAR)
+                api_key or os.getenv(self.ENV_VAR) or os.getenv(self.ENV_VAR_EXPERIMENTAL)
+            )
+            env_hint = f"{self.ENV_VAR} or {self.ENV_VAR_EXPERIMENTAL}"
+            default_model = self.EXPERIMENTAL_MODEL
+            default_base = self.EXPERIMENTAL_BASE_URL
+        else:
+            raise RuntimeError(
+                "Production provider 'avocado' (https://api.ai.meta.com/v1) "
+                "is not setup yet. Please use --llm-provider avocado_free "
+                "(experimental, https://api.llama.com/experimental/compat/openai/v1) "
+                "with KERNELSMITH_MODEL_API_KEY or LLAMA_API_KEY. "
+                "See README.md LLM Configuration."
+            )
+
+        if not self.api_key:
+            primary_env = env_hint.split(" or ")[0]
+            raise RuntimeError(
+                f"{env_hint} not set. "
+                f"Add it to your OS environment: "
+                f'export {primary_env}="your_key" (bash/zsh) or '
+                f'setx {primary_env} "your_key" (Windows). '
+                f"For dev, set {self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}. "
+                f"See README.md LLM Configuration."
             )
             env_hint = f"{self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}"
             default_model = self.EXPERIMENTAL_MODEL

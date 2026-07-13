@@ -112,35 +112,28 @@ pytest -v
 KernelSmith uses Meta's Avocado to generate optimized kernels. Provider concept renamed to **LLM provider** for clarity.
 
 **Providers:**
-- `avocado_free` (default) – Experimental free tier, works with your curl test, uses `https://api.llama.com/experimental/compat/openai/v1`, model `avocado_metacode_rc`, env `LLAMA_API_KEY` (fallback to `KERNELSMITH_MODEL_API_KEY`)
-- `avocado` – Prod, `https://api.ai.meta.com/v1`, model `avocado_metacode_rc`, env `KERNELSMITH_MODEL_API_KEY`
+- `avocado_free` (default, working) – Experimental free tier, uses `https://api.llama.com/experimental/compat/openai/v1`, model `avocado_metacode_rc`, env `KERNELSMITH_MODEL_API_KEY` (or `LLAMA_API_KEY` fallback). This is what you have access to.
+- `avocado` – Prod, `https://api.ai.meta.com/v1` – **Not setup yet, throws error** – use `avocado_free` for now.
 - `mock` – Offline canned response, no key needed (for tests/CI)
 
-**Prod:**
+**Experimental / Free (avocado_free, default, working):**
 - Model: `avocado_metacode_rc`
-- Env var: `KERNELSMITH_MODEL_API_KEY`
-- Base URL: `https://api.ai.meta.com/v1`
-
-**Experimental / Free (avocado_free, default):**
-- Model: `avocado_metacode_rc`
-- Env var: `LLAMA_API_KEY` or `KERNELSMITH_MODEL_API_KEY`
+- Env var: `KERNELSMITH_MODEL_API_KEY` (primary) or `LLAMA_API_KEY`
 - Base URL: `https://api.llama.com/experimental/compat/openai/v1`
-- Flag: `--llm-provider avocado_free` (default), previously `--dev`
-- You tested `aws-claude-4-8-opus-aai` via curl on experimental endpoint – that also works via `--model`, but your access is to `avocado_metacode_rc`
+- Flag: `--llm-provider avocado_free` (default)
+
+**Prod (avocado, not setup yet):**
+- Currently throws: "Production provider 'avocado' is not setup yet. Please use --llm-provider avocado_free"
+- Future: `https://api.ai.meta.com/v1` with `KERNELSMITH_MODEL_API_KEY`
 
 ### Setup
 
-**Prod key:**
+**For avocado_free (default, working) – needs KERNELSMITH key:**
 ```bash
-export KERNELSMITH_MODEL_API_KEY="your_api_key_here"
+export KERNELSMITH_MODEL_API_KEY="your_api_key_here"  # primary for experimental
+# or
+export LLAMA_API_KEY="your_llama_key"  # fallback
 echo 'export KERNELSMITH_MODEL_API_KEY="your_api_key_here"' >> ~/.zshrc
-```
-
-**Experimental key (for --dev):**
-```bash
-export LLAMA_API_KEY="your_llama_key"
-# or fallback to KERNELSMITH key:
-export KERNELSMITH_MODEL_API_KEY="..."
 ```
 
 **Via .env:**
@@ -151,24 +144,24 @@ LLAMA_API_KEY=...
 
 **Verify:**
 ```bash
-echo $KERNELSMITH_MODEL_API_KEY
-python -c "import os; print('prod' if os.getenv('KERNELSMITH_MODEL_API_KEY') else 'MISSING')"
-echo $LLAMA_API_KEY
+echo $KERNELSMITH_MODEL_API_KEY | cut -c1-20
+python -c "import os; print('set' if os.getenv('KERNELSMITH_MODEL_API_KEY') else 'MISSING')"
 ```
 
 **Usage:**
 ```bash
-# Default: avocado_free (experimental free tier, needs LLAMA_API_KEY, model avocado_metacode_rc)
+# Default: avocado_free (needs KERNELSMITH_MODEL_API_KEY, your working key)
 kernelsmith optimize relu --target cortex-m7 -o ./output/
-
-# Prod (explicit)
-kernelsmith optimize relu --target cortex-m7 --llm-provider avocado -o ./output/
 
 # Mock offline (no key, for CI/tests)
 kernelsmith optimize relu --target cortex-m7 --llm-provider mock -o ./output/
 
-# Custom model (e.g., your earlier curl test with aws-claude)
-kernelsmith optimize relu --target cortex-m7 --llm-provider avocado_free --model aws-claude-4-8-opus-aai -o ./output/
+# Prod (currently not setup – will error, use avocado_free)
+kernelsmith optimize relu --target cortex-m7 --llm-provider avocado -o ./output/
+# -> Error: Production provider 'avocado' is not setup yet...
+
+# Custom model
+kernelsmith optimize relu --target cortex-m7 --model aws-claude-4-8-opus-aai -o ./output/
 
 # With custom spec
 kernelsmith optimize relu --target cortex-m7 --spec ./my_relu.yaml -o ./output/
