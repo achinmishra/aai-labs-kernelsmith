@@ -43,11 +43,18 @@ def main() -> None:
     help="Output directory for .h/.c/.md triplet.",
 )
 @click.option(
-    "--provider",
+    "--llm-provider",
+    "llm_provider",
     type=click.Choice(["mock", "avocado"]),
-    default="mock",
+    default="avocado",
     show_default=True,
-    help="LLM provider. mock=offline, avocado=Avocado API (needs KERNELSMITH_MODEL_API_KEY).",
+    help="LLM provider: avocado=API (needs KERNELSMITH_MODEL_API_KEY), mock=offline.",
+)
+@click.option(
+    "--provider",
+    "llm_provider",
+    type=click.Choice(["mock", "avocado"]),
+    hidden=True,
 )
 @click.option(
     "--template",
@@ -60,14 +67,14 @@ def main() -> None:
     type=str,
     default="avocado_metacode_rc",
     show_default=True,
-    help="Model name for Avocado provider.",
+    help="Model name for Avocado LLM.",
 )
 def optimize_cmd(
     operator: str,
     target_name: str,
     spec_path: pathlib.Path | None,
     output_dir: pathlib.Path,
-    provider: str,
+    llm_provider: str,
     template: pathlib.Path | None,
     model: str,
 ) -> None:
@@ -83,7 +90,7 @@ def optimize_cmd(
             target=target_name,
             spec_path=spec_path,
             output_dir=output_dir,
-            provider_name=provider,
+            llm_provider_name=llm_provider,
             template_path=template,
             model=model,
         )
@@ -132,11 +139,18 @@ def optimize_cmd(
     help="Output directory.",
 )
 @click.option(
-    "--provider",
+    "--llm-provider",
+    "llm_provider",
     type=click.Choice(["mock", "avocado"]),
-    default="mock",
+    default="avocado",
     show_default=True,
     help="LLM provider.",
+)
+@click.option(
+    "--provider",
+    "llm_provider",
+    type=click.Choice(["mock", "avocado"]),
+    hidden=True,
 )
 @click.option(
     "--template",
@@ -156,7 +170,7 @@ def generate_cmd(
     target_name: str,
     spec_path: pathlib.Path | None,
     output_dir: pathlib.Path,
-    provider: str,
+    llm_provider: str,
     template: pathlib.Path | None,
     model: str,
 ) -> None:
@@ -169,7 +183,7 @@ def generate_cmd(
         target_name=target_name,
         spec_path=spec_path,
         output_dir=output_dir,
-        provider=provider,
+        llm_provider=llm_provider,
         template=template,
         model=model,
     )

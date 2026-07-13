@@ -21,16 +21,20 @@ def optimize(
     target: str,
     spec_path: pathlib.Path | None = None,
     output_dir: pathlib.Path = pathlib.Path("./output"),
-    provider_name: str = "mock",
+    llm_provider_name: str = "avocado",
     template_path: pathlib.Path | None = None,
     model: str = "avocado_metacode_rc",
+    provider_name: str | None = None,
 ) -> OptimizeResult:
+    if provider_name is not None and llm_provider_name == "avocado":
+        llm_provider_name = provider_name
+
     operator_path = resolve_operator_spec(operator, custom_spec=spec_path)
     target_path = resolve_hardware_profile(target)
 
     prompt = build_prompt(operator_path, target_path, template_path=template_path)
 
-    provider: LLMProvider = get_provider(provider_name, model=model)
+    provider: LLMProvider = get_provider(llm_provider_name, model=model)
 
     raw_response = provider.generate(prompt)
 
@@ -46,7 +50,7 @@ def optimize(
     )
 
     actual_model = getattr(provider, "MODEL", model) if hasattr(provider, "MODEL") else model
-    if provider_name == "mock":
+    if llm_provider_name == "mock":
         actual_model = "avocado_metacode_rc (mock)"
 
     return OptimizeResult(
