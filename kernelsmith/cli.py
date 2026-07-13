@@ -90,7 +90,7 @@ def optimize_cmd(
     target_name = target_name.lower()
     effective_model = model
     if effective_model is None:
-        effective_model = "aws-claude-4-8-opus-aai" if dev else "avocado_metacode_rc"
+        effective_model = "avocado_metacode_rc"
     try:
         result = optimize_fn(
             operator=operator,

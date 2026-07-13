@@ -129,31 +129,10 @@ class AvocadoProvider(LLMProvider):
                 f"Add it to your OS environment: "
                 f'export {primary_env}="your_key" (bash/zsh) or '
                 f'setx {primary_env} "your_key" (Windows). '
-                f"For dev, set {self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}. "
                 f"See README.md LLM Configuration."
             )
-            env_hint = f"{self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}"
-            default_model = self.EXPERIMENTAL_MODEL
-            default_base = self.EXPERIMENTAL_BASE_URL
-        else:
-            self.api_key = api_key or os.getenv(self.ENV_VAR)
-            env_hint = self.ENV_VAR
-            default_model = self.MODEL
-            default_base = self.BASE_URL
 
-        if not self.api_key:
-            primary_env = env_hint.split(" or ")[0]
-            raise RuntimeError(
-                f"{env_hint} not set. "
-                f"Add it to your OS environment: "
-                f'export {primary_env}="your_key" (bash/zsh) or '
-                f'setx {primary_env} "your_key" (Windows). '
-                f"For dev, set {self.ENV_VAR_EXPERIMENTAL} or {self.ENV_VAR}. "
-                f"See README.md LLM Configuration."
-            )
         self.model = model or default_model
-        if self.experimental and model is None:
-            self.model = default_model
         self.base_url = base_url or default_base
         self.max_retries = max_retries
         self.timeout = timeout
