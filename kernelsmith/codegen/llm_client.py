@@ -169,6 +169,25 @@ class AvocadoProvider(LLMProvider):
                     return text
                 raise RuntimeError("Empty response from LLM")
             except Exception as exc:
+                err_str = str(exc).lower()
+                if (
+                    "model_not_found" in err_str
+                    or "model was not found" in err_str
+                    or "404" in err_str
+                ):
+                    try:
+                        models = client.models.list()
+                        avail = [m.id for m in models.data[:20]]
+                        avail_str = ", ".join(avail) if avail else "none listed"
+                    except Exception:
+                        avail_str = "could not list (check API key and base_url)"
+                    raise RuntimeError(
+                        f"Model '{self.model}' not found at {self.base_url}. "
+                        f"Available (first 20): {avail_str}. "
+                        f"Try --model <available> or check KERNELSMITH_MODEL_API_KEY "
+                        f"and base_url https://api.ai.meta.com/v1. "
+                        f"Original error: {exc}"
+                    ) from exc
                 last_exc = exc
                 if attempt < self.max_retries - 1:
                     time.sleep(2**attempt)
