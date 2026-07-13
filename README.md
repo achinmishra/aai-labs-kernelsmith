@@ -107,17 +107,66 @@ ruff format --check .
 pytest -v
 ```
 
+## LLM Configuration (Code Generation)
+
+KernelSmith uses Meta's Avocado / Muse Spark to generate optimized kernels.
+
+**Model:** `avocado_metacode_rc`
+
+**Env var:** `KERNELSMITH_MODEL_API_KEY` (was `MODEL_API_KEY`, now namespaced for kernelsmith)
+
+### Setup
+
+Add the API key to your OS environment:
+
+**Linux / macOS (bash/zsh):**
+```bash
+export KERNELSMITH_MODEL_API_KEY="your_api_key_here"
+# Persist in shell rc:
+echo 'export KERNELSMITH_MODEL_API_KEY="your_api_key_here"' >> ~/.zshrc
+# or ~/.bashrc
+```
+
+**Windows (PowerShell):**
+```powershell
+$env:KERNELSMITH_MODEL_API_KEY="your_api_key_here"
+# Persist:
+setx KERNELSMITH_MODEL_API_KEY "your_api_key_here"
+```
+
+**Via .env file (with python-dotenv):**
+```bash
+# .env in repo root (gitignored)
+KERNELSMITH_MODEL_API_KEY=your_api_key_here
+```
+
+**Verify:**
+```bash
+echo $KERNELSMITH_MODEL_API_KEY  # should print key
+python -c "import os; print('set' if os.getenv('KERNELSMITH_MODEL_API_KEY') else 'NOT SET')"
+```
+
+**Usage with generate command (once implemented):**
+```bash
+kernelsmith generate relu --target cortex-m7 --output-dir ./output/
+# Uses model avocado_metacode_rc at https://api.ai.meta.com/v1
+# If key missing, CLI will error: "KERNELSMITH_MODEL_API_KEY not set – see README"
+```
+
+For CI/tests, mock provider is used so no key needed.
+
 ## Dependencies
 
 Pinned with `==`:
 
 - prod: `click==8.1.8`, `pyyaml==6.0.2`, `numpy==1.26.4`, `jinja2==3.1.5`
 - dev: `pytest==8.3.4`, `ruff==0.9.6`, `pre-commit==4.0.1`
+- future: `pydantic==2.8.2`, `openai==1.30.5` (for Avocado client)
 
 ## Examples
 
-- Operator spec: `examples/operators/relu.yaml`
-- Hardware profile: `examples/hardware/cortex-m7.yaml`
+- Operator spec: `examples/operators/relu.yaml` → future `kernelsmith/operators/relu.yaml` (single operator ReLU picked for initial E2E)
+- Hardware profile: `examples/hardware/cortex-m7.yaml` → future `kernelsmith/hardware_profiles/cortex_m7.yaml`
 - Naive C: `reference/naive/relu.c`
 
 ## License
