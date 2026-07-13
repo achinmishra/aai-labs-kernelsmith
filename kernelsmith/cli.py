@@ -4,6 +4,10 @@ import click
 import yaml
 
 from kernelsmith import __version__
+from kernelsmith.codegen.optimize import optimize as optimize_fn
+from kernelsmith.codegen.prompt_builder import (
+    list_builtin_targets,
+)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -13,57 +17,162 @@ def main() -> None:
 
 
 @main.command(name="optimize")
-@click.option(
-    "--operator",
-    "-o",
-    "operator_spec",
-    type=click.Path(exists=True, path_type=pathlib.Path),
-    required=True,
-    help="Path to operator spec YAML (e.g., examples/operators/relu.yaml).",
-)
+@click.argument("operator", type=str)
 @click.option(
     "--target",
     "-t",
-    "target_spec",
-    type=click.Path(exists=True, path_type=pathlib.Path),
+    "target_name",
+    type=str,
     required=True,
-    help="Path to hardware profile YAML (e.g., examples/hardware/cortex-m7.yaml).",
+    help="Target device (e.g., cortex-m7).",
 )
 @click.option(
-    "--output",
-    "-O",
+    "--spec",
+    "spec_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="User-provided operator spec YAML. Falls back to built-in.",
+)
+@click.option(
+    "--output-dir",
+    "-o",
     "output_dir",
     type=click.Path(path_type=pathlib.Path),
-    default=pathlib.Path("./generated"),
+    default=pathlib.Path("./output"),
     show_default=True,
-    help="Output directory for generated C code.",
+    help="Output directory for .h/.c/.md triplet.",
+)
+@click.option(
+    "--provider",
+    type=click.Choice(["mock", "avocado"]),
+    default="mock",
+    show_default=True,
+    help="LLM provider. mock=offline, avocado=Avocado API (needs KERNELSMITH_MODEL_API_KEY).",
 )
 @click.option(
     "--template",
-    type=click.Path(path_type=pathlib.Path),
+    type=click.Path(exists=True, path_type=pathlib.Path),
     default=None,
-    help="Optional Jinja2 template override.",
+    help="Custom prompt template override.",
+)
+@click.option(
+    "--model",
+    type=str,
+    default="avocado_metacode_rc",
+    show_default=True,
+    help="Model name for Avocado provider.",
 )
 def optimize_cmd(
-    operator_spec: pathlib.Path,
-    target_spec: pathlib.Path,
+    operator: str,
+    target_name: str,
+    spec_path: pathlib.Path | None,
     output_dir: pathlib.Path,
+    provider: str,
     template: pathlib.Path | None,
+    model: str,
 ) -> None:
-    """Generate optimized C kernel for given operator and target."""
-    click.echo("TODO: optimize command will:")
-    click.echo(f"  - Parse operator spec: {operator_spec}")
-    click.echo(f"  - Parse hardware profile: {target_spec}")
-    click.echo(
-        "  - Apply hardware-aware optimization passes for Cortex-M7 "
-        "(DSP, FPU, M-Profile Vector Extension)"
+    """Generate optimized C kernel for OPERATOR and target.
+
+    Example: kernelsmith optimize relu --target cortex-m7 --output-dir ./output
+    """
+    operator = operator.lower()
+    target_name = target_name.lower()
+    try:
+        result = optimize_fn(
+            operator=operator,
+            target=target_name,
+            spec_path=spec_path,
+            output_dir=output_dir,
+            provider_name=provider,
+            template_path=template,
+            model=model,
+        )
+        click.echo(f"Generated files for {operator} ({target_name}):")
+        click.echo(f"  Header: {result.files.header_path}")
+        click.echo(f"  Implementation: {result.files.c_path}")
+        click.echo(f"  Reasoning: {result.files.md_path}")
+        click.echo(f"  Model: {result.model}")
+        click.echo(f"  Operator spec: {result.operator_path}")
+        click.echo(f"  Hardware profile: {result.target_path}")
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+    except Exception as e:
+        click.echo(f"Unexpected error: {e}", err=True)
+        raise click.Abort() from e
+
+
+@main.command(name="generate")
+@click.argument("operator", type=str)
+@click.option(
+    "--target",
+    "-t",
+    "target_name",
+    type=str,
+    required=True,
+    help="Target device (e.g., cortex-m7).",
+)
+@click.option(
+    "--spec",
+    "spec_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="User-provided operator spec YAML.",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    "output_dir",
+    type=click.Path(path_type=pathlib.Path),
+    default=pathlib.Path("./output"),
+    show_default=True,
+    help="Output directory.",
+)
+@click.option(
+    "--provider",
+    type=click.Choice(["mock", "avocado"]),
+    default="mock",
+    show_default=True,
+    help="LLM provider.",
+)
+@click.option(
+    "--template",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="Custom template.",
+)
+@click.option(
+    "--model",
+    type=str,
+    default="avocado_metacode_rc",
+    show_default=True,
+    help="Model name.",
+)
+def generate_cmd(
+    operator: str,
+    target_name: str,
+    spec_path: pathlib.Path | None,
+    output_dir: pathlib.Path,
+    provider: str,
+    template: pathlib.Path | None,
+    model: str,
+) -> None:
+    """Alias for optimize (kept for backward compat with brief doc)."""
+    click.echo("Note: `generate` is alias for `optimize`, prefer `optimize`")
+    ctx = click.get_current_context()
+    ctx.invoke(
+        optimize_cmd,
+        operator=operator,
+        target_name=target_name,
+        spec_path=spec_path,
+        output_dir=output_dir,
+        provider=provider,
+        template=template,
+        model=model,
     )
-    if template:
-        click.echo(f"  - Render with custom Jinja2 template: {template}")
-    else:
-        click.echo("  - Render with built-in Jinja2 templates")
-    click.echo(f"  - Emit optimized C code to: {output_dir}")
-    click.echo("  - Future: autotune tiling, loop unrolling, SIMD intrinsics")
 
 
 @main.command(name="benchmark")
@@ -101,7 +210,7 @@ def benchmark_cmd(
     iterations: int,
     qemu: bool,
 ) -> None:
-    """Benchmark a kernel using arm-none-eabi-gcc and QEMU."""
+    """Benchmark a kernel using arm-none-eabi-gcc and QEMU (future)."""
     click.echo("TODO: benchmark command will:")
     click.echo(f"  - Compile kernel {kernel} with arm-none-eabi-gcc for target {target}")
     click.echo("  - If --qemu: launch qemu-system-arm or qemu-user to emulate Cortex-M7")
@@ -145,69 +254,81 @@ def validate_cmd(
     operator: pathlib.Path,
     tolerance: float,
 ) -> None:
-    """Validate optimized kernel correctness against reference."""
+    """Validate optimized kernel correctness against reference (future)."""
     click.echo("TODO: validate command will:")
     click.echo(f"  - Compile both generated {generated} and reference {reference}")
     click.echo("    with arm-none-eabi-gcc")
     click.echo(f"  - Load operator spec {operator} to generate random test tensors (via numpy)")
-    click.echo(
-        f"  - Run both implementations under qemu-user and compare outputs "
-        f"with tolerance {tolerance}"
-    )
-    click.echo("  - Report mismatches and numerical error statistics")
+    click.echo(f"  - Run both impls under qemu-user and compare with tolerance {tolerance}")
 
 
 @main.command(name="list-operators")
 @click.option(
     "--spec-dir",
-    type=click.Path(exists=True, path_type=pathlib.Path),
-    default=pathlib.Path("examples/operators"),
-    show_default=True,
-    help="Directory containing operator spec YAMLs.",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Directory containing operator spec YAMLs (defaults to built-in).",
 )
-def list_operators_cmd(spec_dir: pathlib.Path) -> None:
-    """List available operator specifications."""
-    click.echo("TODO: list-operators command will:")
-    click.echo(f"  - Scan {spec_dir} for YAML operator specs")
-    click.echo("  - Parse each spec and display name, op_type, description, inputs/outputs")
-    if spec_dir.exists():
-        specs = list(spec_dir.glob("*.yaml")) + list(spec_dir.glob("*.yml"))
-        if specs:
-            click.echo(f"\nFound {len(specs)} operator spec(s):")
-            for s in specs:
+def list_operators_cmd(spec_dir: pathlib.Path | None) -> None:
+    """List available operator specifications (built-in registry)."""
+    if spec_dir:
+        search_dirs = [spec_dir]
+    else:
+        from kernelsmith.codegen.prompt_builder import list_builtin_operators as list_ops
+
+        builtins = list_ops()
+        if builtins:
+            click.echo(f"Found {len(builtins)} built-in operator spec(s):")
+            for s in builtins:
                 try:
                     data = yaml.safe_load(s.read_text())
                     name = data.get("name", s.stem) if isinstance(data, dict) else s.stem
                     op_type = (
                         data.get("op_type", "unknown") if isinstance(data, dict) else "unknown"
                     )
-                    click.echo(f"  - {name} ({op_type}): {s}")
+                    desc = data.get("description", "") if isinstance(data, dict) else ""
+                    click.echo(f"  - {name} ({op_type}): {s} – {desc[:60]}")
                 except Exception:
                     click.echo(f"  - {s.stem}: {s} [failed to parse]")
-        else:
-            click.echo(f"\nNo specs found in {spec_dir}, but scanning logic is ready.")
-    else:
-        click.echo(f"  (spec dir {spec_dir} does not exist yet)")
+            return
+        search_dirs = [
+            pathlib.Path("kernelsmith/operators"),
+            pathlib.Path("examples/operators"),
+        ]
+
+    for d in search_dirs:
+        if d.exists():
+            specs = list(d.glob("*.yaml")) + list(d.glob("*.yml"))
+            if specs:
+                click.echo(f"Found {len(specs)} operator spec(s) in {d}:")
+                for s in specs:
+                    try:
+                        data = yaml.safe_load(s.read_text())
+                        name = data.get("name", s.stem) if isinstance(data, dict) else s.stem
+                        op_type = (
+                            data.get("op_type", "unknown") if isinstance(data, dict) else "unknown"
+                        )
+                        click.echo(f"  - {name} ({op_type}): {s}")
+                    except Exception:
+                        click.echo(f"  - {s.stem}: {s} [failed to parse]")
 
 
 @main.command(name="list-targets")
 @click.option(
     "--target-dir",
-    type=click.Path(exists=True, path_type=pathlib.Path),
-    default=pathlib.Path("examples/hardware"),
-    show_default=True,
-    help="Directory containing hardware profile YAMLs.",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Directory containing hardware profile YAMLs (defaults to built-in).",
 )
-def list_targets_cmd(target_dir: pathlib.Path) -> None:
-    """List available hardware target profiles."""
-    click.echo("TODO: list-targets command will:")
-    click.echo(f"  - Scan {target_dir} for hardware profile YAMLs")
-    click.echo("  - Parse each profile and display architecture, CPU, features, memory")
-    if target_dir.exists():
-        profiles = list(target_dir.glob("*.yaml")) + list(target_dir.glob("*.yml"))
-        if profiles:
-            click.echo(f"\nFound {len(profiles)} hardware profile(s):")
-            for p in profiles:
+def list_targets_cmd(target_dir: pathlib.Path | None) -> None:
+    """List available hardware target profiles (built-in registry)."""
+    if target_dir:
+        search_dirs = [target_dir]
+    else:
+        builtins = list_builtin_targets()
+        if builtins:
+            click.echo(f"Found {len(builtins)} built-in hardware profile(s):")
+            for p in builtins:
                 try:
                     data = yaml.safe_load(p.read_text())
                     name = data.get("name", p.stem) if isinstance(data, dict) else p.stem
@@ -217,10 +338,29 @@ def list_targets_cmd(target_dir: pathlib.Path) -> None:
                     click.echo(f"  - {name} ({arch}): {p}")
                 except Exception:
                     click.echo(f"  - {p.stem}: {p} [failed to parse]")
-        else:
-            click.echo(f"\nNo profiles found in {target_dir}, but scanning logic is ready.")
-    else:
-        click.echo(f"  (target dir {target_dir} does not exist yet)")
+            return
+        search_dirs = [
+            pathlib.Path("kernelsmith/hardware_profiles"),
+            pathlib.Path("examples/hardware"),
+        ]
+
+    for d in search_dirs:
+        if d.exists():
+            profiles = list(d.glob("*.yaml")) + list(d.glob("*.yml"))
+            if profiles:
+                click.echo(f"Found {len(profiles)} hardware profile(s) in {d}:")
+                for p in profiles:
+                    try:
+                        data = yaml.safe_load(p.read_text())
+                        name = data.get("name", p.stem) if isinstance(data, dict) else p.stem
+                        arch = (
+                            data.get("architecture", "unknown")
+                            if isinstance(data, dict)
+                            else "unknown"
+                        )
+                        click.echo(f"  - {name} ({arch}): {p}")
+                    except Exception:
+                        click.echo(f"  - {p.stem}: {p} [failed to parse]")
 
 
 @main.command(name="export-data")
@@ -253,12 +393,11 @@ def export_data_cmd(
     export_format: str,
     output: pathlib.Path,
 ) -> None:
-    """Export benchmarking data to different formats."""
+    """Export benchmarking data to different formats (future)."""
     click.echo("TODO: export-data command will:")
     click.echo(f"  - Load benchmark data from {input_path}")
-    click.echo(f"  - Convert to {export_format} format with numpy/pandas processing")
-    click.echo(f"  - Write filtered/aggregated dataset to {output}")
-    click.echo("  - Support dataset splitting for ML-driven cost modeling")
+    click.echo(f"  - Convert to {export_format} format")
+    click.echo(f"  - Write to {output}")
 
 
 @main.command(name="report")
@@ -290,13 +429,11 @@ def report_cmd(
     output: pathlib.Path,
     template: str,
 ) -> None:
-    """Generate performance report from benchmark data."""
+    """Generate performance report from benchmark data (future)."""
     click.echo("TODO: report command will:")
     click.echo(f"  - Load results from {input_path}")
-    click.echo("  - Aggregate per-operator and per-target statistics using numpy")
-    click.echo(f"  - Render {template} Jinja2 template to {output}")
-    click.echo("  - Include tables, speedup vs naive, cycle counts, code size")
-    click.echo("  - Future: embed flame graphs, Roofline model plots")
+    click.echo("  - Aggregate per-operator and per-target statistics")
+    click.echo(f"  - Render {template} template to {output}")
 
 
 if __name__ == "__main__":
