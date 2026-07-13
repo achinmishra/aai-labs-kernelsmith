@@ -88,7 +88,7 @@ class MockProvider(LLMProvider):
 
 class AvocadoProvider(LLMProvider):
     MODEL = "avocado_metacode_rc"
-    EXPERIMENTAL_MODEL = "aws-claude-4-8-opus-aai"
+    EXPERIMENTAL_MODEL = "avocado_metacode_rc"
     ENV_VAR = "KERNELSMITH_MODEL_API_KEY"
     ENV_VAR_EXPERIMENTAL = "LLAMA_API_KEY"
     BASE_URL = "https://api.ai.meta.com/v1"
@@ -252,4 +252,7 @@ def get_provider(name: str = "mock", **kwargs) -> LLMProvider:
         return MockProvider(**kwargs)
     if name in ("avocado", "avocado_metacode_rc", "metacode", "muse"):
         return AvocadoProvider(**kwargs)
-    raise ValueError(f"Unknown LLM provider: {name}. Available: mock, avocado")
+    if name in ("avocado_free", "avocado-free", "free"):
+        kwargs.setdefault("experimental", True)
+        return AvocadoProvider(**kwargs)
+    raise ValueError(f"Unknown LLM provider: {name}. Available: mock, avocado, avocado_free")

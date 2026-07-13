@@ -109,18 +109,24 @@ pytest -v
 
 ## LLM Configuration (Code Generation)
 
-KernelSmith uses Meta's Avocado / Muse Spark to generate optimized kernels.
+KernelSmith uses Meta's Avocado to generate optimized kernels. Provider concept renamed to **LLM provider** for clarity.
+
+**Providers:**
+- `avocado_free` (default) – Experimental free tier, works with your curl test, uses `https://api.llama.com/experimental/compat/openai/v1`, model `avocado_metacode_rc`, env `LLAMA_API_KEY` (fallback to `KERNELSMITH_MODEL_API_KEY`)
+- `avocado` – Prod, `https://api.ai.meta.com/v1`, model `avocado_metacode_rc`, env `KERNELSMITH_MODEL_API_KEY`
+- `mock` – Offline canned response, no key needed (for tests/CI)
 
 **Prod:**
 - Model: `avocado_metacode_rc`
 - Env var: `KERNELSMITH_MODEL_API_KEY`
 - Base URL: `https://api.ai.meta.com/v1`
 
-**Experimental / Dev (works with curl you tested):**
-- Model: `aws-claude-4-8-opus-aai` (or other experimental)
-- Env var: `LLAMA_API_KEY` (fallback to `KERNELSMITH_MODEL_API_KEY`)
+**Experimental / Free (avocado_free, default):**
+- Model: `avocado_metacode_rc`
+- Env var: `LLAMA_API_KEY` or `KERNELSMITH_MODEL_API_KEY`
 - Base URL: `https://api.llama.com/experimental/compat/openai/v1`
-- Flag: `--dev` / `--experimental`
+- Flag: `--llm-provider avocado_free` (default), previously `--dev`
+- You tested `aws-claude-4-8-opus-aai` via curl on experimental endpoint – that also works via `--model`, but your access is to `avocado_metacode_rc`
 
 ### Setup
 
@@ -152,18 +158,20 @@ echo $LLAMA_API_KEY
 
 **Usage:**
 ```bash
-# Prod (default avocado provider, model avocado_metacode_rc)
+# Default: avocado_free (experimental free tier, needs LLAMA_API_KEY, model avocado_metacode_rc)
 kernelsmith optimize relu --target cortex-m7 -o ./output/
 
-# Explicit mock (offline, no key needed)
+# Prod (explicit)
+kernelsmith optimize relu --target cortex-m7 --llm-provider avocado -o ./output/
+
+# Mock offline (no key, for CI/tests)
 kernelsmith optimize relu --target cortex-m7 --llm-provider mock -o ./output/
 
-# Dev / experimental (uses LLAMA_API_KEY and experimental endpoint)
-kernelsmith optimize relu --target cortex-m7 --dev -o ./output/
-kernelsmith optimize relu --target cortex-m7 --dev --model aws-claude-4-8-opus-aai -o ./output/
+# Custom model (e.g., your earlier curl test with aws-claude)
+kernelsmith optimize relu --target cortex-m7 --llm-provider avocado_free --model aws-claude-4-8-opus-aai -o ./output/
 
-# Custom model
-kernelsmith optimize relu --target cortex-m7 --model <available-model> -o ./output/
+# With custom spec
+kernelsmith optimize relu --target cortex-m7 --spec ./my_relu.yaml -o ./output/
 ```
 
 For CI/tests, mock provider is used so no key needed.

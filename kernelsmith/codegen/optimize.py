@@ -21,22 +21,20 @@ def optimize(
     target: str,
     spec_path: pathlib.Path | None = None,
     output_dir: pathlib.Path = pathlib.Path("./output"),
-    llm_provider_name: str = "avocado",
+    llm_provider_name: str = "avocado_free",
     template_path: pathlib.Path | None = None,
     model: str = "avocado_metacode_rc",
     provider_name: str | None = None,
     experimental: bool = False,
     dev: bool = False,
 ) -> OptimizeResult:
-    if provider_name is not None and llm_provider_name == "avocado":
+    if provider_name is not None and llm_provider_name in ("avocado", "avocado_free"):
         llm_provider_name = provider_name
 
-    is_experimental = experimental or dev
+    is_experimental = experimental or dev or llm_provider_name == "avocado_free"
 
     if model is None:
-        model = "aws-claude-4-8-opus-aai" if is_experimental else "avocado_metacode_rc"
-    elif is_experimental and model == "avocado_metacode_rc":
-        model = "aws-claude-4-8-opus-aai"
+        model = "avocado_metacode_rc"
 
     operator_path = resolve_operator_spec(operator, custom_spec=spec_path)
     target_path = resolve_hardware_profile(target)

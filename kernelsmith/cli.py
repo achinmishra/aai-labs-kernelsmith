@@ -46,10 +46,10 @@ def main() -> None:
     "--llm-provider",
     "--provider",
     "llm_provider",
-    type=click.Choice(["mock", "avocado"]),
-    default="avocado",
+    type=click.Choice(["mock", "avocado", "avocado_free"]),
+    default="avocado_free",
     show_default=True,
-    help="LLM provider: avocado=API (needs KERNELSMITH_MODEL_API_KEY), mock=offline.",
+    help="LLM provider: avocado_free=free (LLAMA_API_KEY, default), avocado=prod, mock=offline.",
 )
 @click.option(
     "--template",
@@ -61,7 +61,7 @@ def main() -> None:
     "--model",
     type=str,
     default=None,
-    help="Model name. Prod default avocado_metacode_rc, dev default aws-claude-4-8-opus-aai.",
+    help="Model name. Default avocado_metacode_rc (prod and dev).",
 )
 @click.option(
     "--dev",
@@ -69,7 +69,8 @@ def main() -> None:
     "dev",
     is_flag=True,
     default=False,
-    help="Use experimental endpoint (api.llama.com) with LLAMA_API_KEY.",
+    hidden=True,
+    help="Deprecated: use --llm-provider avocado_free.",
 )
 def optimize_cmd(
     operator: str,
@@ -149,10 +150,10 @@ def optimize_cmd(
     "--llm-provider",
     "--provider",
     "llm_provider",
-    type=click.Choice(["mock", "avocado"]),
-    default="avocado",
+    type=click.Choice(["mock", "avocado", "avocado_free"]),
+    default="avocado_free",
     show_default=True,
-    help="LLM provider: avocado=API, mock=offline.",
+    help="LLM provider: avocado_free=free (LLAMA_API_KEY, default), avocado=prod, mock=offline.",
 )
 @click.option(
     "--template",
@@ -164,7 +165,7 @@ def optimize_cmd(
     "--model",
     type=str,
     default=None,
-    help="Model name. Prod default avocado_metacode_rc, dev default aws-claude-4-8-opus-aai.",
+    help="Model name. Default avocado_metacode_rc (prod and dev).",
 )
 @click.option(
     "--dev",
@@ -172,7 +173,8 @@ def optimize_cmd(
     "dev",
     is_flag=True,
     default=False,
-    help="Use experimental endpoint (api.llama.com) with LLAMA_API_KEY.",
+    hidden=True,
+    help="Deprecated: use --llm-provider avocado_free.",
 )
 def generate_cmd(
     operator: str,
