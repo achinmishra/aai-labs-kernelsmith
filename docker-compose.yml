@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  kernelsmith:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kernelsmith:latest
+    container_name: kernelsmith-dev
+    volumes:
+      - ./:/app
+      - kernelsmith-workspace:/workspace
+      - ./examples:/workspace/examples:ro
+    working_dir: /workspace
+    environment:
+      - KERNELSMITH_WORKSPACE=/workspace
+      - KERNELSMITH_TARGET_DIR=/app/targets
+      - KERNELSMITH_DEFAULT_TARGET=cortex-m7
+      - KERNELSMITH_QEMU_MODE=auto
+      - KERNELSMITH_METRICS=full
+      - KERNELSMITH_MODEL_API_KEY=${KERNELSMITH_MODEL_API_KEY:-}
+      - LLAMA_API_KEY=${LLAMA_API_KEY:-}
+    entrypoint: ["/usr/local/bin/kernelsmith-entrypoint"]
+    command: ["--help"]
+    stdin_open: true
+    tty: true
+    # privileged needed for some QEMU system features, user mode works without
+    privileged: false
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - ks-net
+
+  # Optional service for interactive development with bash
+  kernelsmith-shell:
+    extends: kernelsmith
+    container_name: kernelsmith-shell
+    entrypoint: ["/bin/bash"]
+    command: []
+    stdin_open: true
+    tty: true
+    profiles: ["shell"]
+
+volumes:
+  kernelsmith-workspace:
+
+networks:
+  ks-net:
+    driver: bridge

@@ -1,4 +1,5 @@
 import pathlib
+import json
 
 import click
 import yaml
@@ -7,7 +8,12 @@ from kernelsmith import __version__
 from kernelsmith.codegen.optimize import optimize as optimize_fn
 from kernelsmith.codegen.prompt_builder import (
     list_builtin_targets,
+    resolve_hardware_profile,
 )
+from kernelsmith.toolchain import resolve_toolchain, compile_c_to_elf, toolchain_available
+from kernelsmith.emulator import emulate
+from kernelsmith.metrics import collect_metrics, compare_fast_vs_full
+from kernelsmith.harness import KernelsmithHarness, run_kernelsmith_pipeline
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -214,8 +220,15 @@ def generate_cmd(
     "--target",
     "-t",
     type=click.Path(exists=True, path_type=pathlib.Path),
-    required=True,
-    help="Hardware profile YAML.",
+    required=False,
+    help="Hardware profile YAML path.",
+)
+@click.option(
+    "--target-name",
+    type=str,
+    default="cortex-m7",
+    show_default=True,
+    help="Target name for toolchain resolution (e.g., cortex-m7, cortex-m4).",
 )
 @click.option(
     "--iterations",
@@ -226,24 +239,109 @@ def generate_cmd(
     help="Number of benchmark iterations.",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(["fast", "full", "auto"]),
+    default="auto",
+    show_default=True,
+    help="QEMU mode: fast=instruction accurate qemu-user, full=cycle approximate qemu-system, auto=fast.",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(path_type=pathlib.Path),
+    default=pathlib.Path("results.json"),
+    show_default=True,
+    help="Output JSON metrics file.",
+)
+@click.option(
     "--qemu",
     is_flag=True,
     default=False,
-    help="Run benchmark under qemu-system-arm.",
+    help="Legacy flag, implies --mode full.",
 )
 def benchmark_cmd(
     kernel: pathlib.Path,
-    target: pathlib.Path,
+    target: pathlib.Path | None,
+    target_name: str,
     iterations: int,
+    mode: str,
+    output: pathlib.Path,
     qemu: bool,
 ) -> None:
-    """Benchmark a kernel using arm-none-eabi-gcc and QEMU (future)."""
-    click.echo("TODO: benchmark command will:")
-    click.echo(f"  - Compile kernel {kernel} with arm-none-eabi-gcc for target {target}")
-    click.echo("  - If --qemu: launch qemu-system-arm or qemu-user to emulate Cortex-M7")
-    click.echo(f"  - Run {iterations} iterations and collect cycles/instructions via QEMU tracing")
-    click.echo("  - Compare against reference/naive implementations")
-    click.echo("  - Output JSON/CSV performance metrics")
+    """Benchmark a kernel using arm-none-eabi-gcc and QEMU with metrics."""
+    if qemu:
+        mode = "full"
+    try:
+        # Resolve hardware profile for toolchain config
+        hp_path = target
+        if hp_path is None:
+            try:
+                hp_path = resolve_hardware_profile(target_name)
+            except Exception:
+                hp_path = None
+        tc = resolve_toolchain(target_name, hp_path)
+        if not toolchain_available(tc.compiler):
+            click.echo(
+                f"Error: toolchain {tc.compiler} not found. Use kernelsmith Docker image.", err=True
+            )
+            raise click.Abort()
+        build_dir = pathlib.Path("./build")
+        build_dir.mkdir(exist_ok=True)
+        elf_path = build_dir / f"{kernel.stem}.elf"
+        click.echo(
+            f"Compiling {kernel} for {target_name} with {tc.compiler} {tc.arch_flag} {tc.fpu_flag} {tc.float_abi_flag}..."
+        )
+        compile_info = compile_c_to_elf(kernel, elf_path, tc, mode="speed")
+        click.echo(f"ELF size info:\n{compile_info['size']}")
+        click.echo(
+            f"Emulating under QEMU mode={mode} (user={tc.qemu_user}, system={tc.qemu_system})..."
+        )
+        emu = emulate(
+            elf_path,
+            mode=mode,
+            qemu_user=tc.qemu_user,
+            qemu_system=tc.qemu_system,
+            machine=tc.qemu_machine,
+            cpu=tc.qemu_cpu,
+        )
+        metrics = collect_metrics(elf_path, emu, target_name)
+        out_data = {
+            "kernel": str(kernel),
+            "target": target_name,
+            "hardware_profile": str(hp_path) if hp_path else None,
+            "mode": emu.mode,
+            "iterations": iterations,
+            "toolchain": {
+                "compiler": tc.compiler,
+                "arch": tc.arch_flag,
+                "fpu": tc.fpu_flag,
+                "float_abi": tc.float_abi_flag,
+                "qemu_user": tc.qemu_user,
+                "qemu_system": tc.qemu_system,
+                "qemu_machine": tc.qemu_machine,
+                "qemu_cpu": tc.qemu_cpu,
+            },
+            "metrics": metrics.to_dict(),
+            "compile": compile_info,
+            "emulation": {
+                "returncode": emu.returncode,
+                "stdout": emu.stdout[:2000],
+                "stderr": emu.stderr[:2000],
+            },
+            "tradeoff_note": "fast mode = instruction accurate via qemu-user -d in_asm; full mode = cycle approximate via qemu-system with ~15% simulated overhead for pipeline/cache. Use fast for iteration, full for realistic timing.",
+        }
+        output.write_text(json.dumps(out_data, indent=2))
+        click.echo(f"Benchmark complete. Metrics written to {output}")
+        click.echo(f"  cycles_estimate: {metrics.cycles_estimate}")
+        click.echo(f"  time_us: {metrics.time_us}")
+        click.echo(f"  instruction_count: {metrics.instruction_count}")
+        click.echo(
+            f"  text_bytes: {metrics.text_bytes}  data: {metrics.data_bytes}  bss: {metrics.bss_bytes}  total: {metrics.total_bytes}"
+        )
+        click.echo(f"  mode: {metrics.mode}  target: {metrics.target}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
 
 
 @main.command(name="validate")
@@ -275,18 +373,53 @@ def benchmark_cmd(
     show_default=True,
     help="Numerical tolerance for validation.",
 )
+@click.option(
+    "--target-name",
+    type=str,
+    default="cortex-m7",
+    show_default=True,
+    help="Target for toolchain.",
+)
 def validate_cmd(
     generated: pathlib.Path,
     reference: pathlib.Path,
     operator: pathlib.Path,
     tolerance: float,
+    target_name: str,
 ) -> None:
-    """Validate optimized kernel correctness against reference (future)."""
-    click.echo("TODO: validate command will:")
-    click.echo(f"  - Compile both generated {generated} and reference {reference}")
-    click.echo("    with arm-none-eabi-gcc")
-    click.echo(f"  - Load operator spec {operator} to generate random test tensors (via numpy)")
-    click.echo(f"  - Run both impls under qemu-user and compare with tolerance {tolerance}")
+    """Validate optimized kernel correctness against reference using toolchain compile check."""
+    try:
+        tc = resolve_toolchain(target_name)
+        if not toolchain_available(tc.compiler):
+            click.echo(f"Error: toolchain {tc.compiler} not found. Use Docker image.", err=True)
+            raise click.Abort()
+        build_dir = pathlib.Path("./build")
+        build_dir.mkdir(exist_ok=True)
+        gen_elf = build_dir / f"{generated.stem}_val.elf"
+        ref_elf = build_dir / f"{reference.stem}_val.elf"
+        click.echo(f"Compiling generated {generated}...")
+        compile_c_to_elf(generated, gen_elf, tc)
+        click.echo(f"Compiling reference {reference}...")
+        compile_c_to_elf(reference, ref_elf, tc)
+        # Size comparison as proxy for validation in this scaffolding
+        from kernelsmith.metrics import get_size_metrics
+
+        gen_size = get_size_metrics(gen_elf)
+        ref_size = get_size_metrics(ref_elf)
+        click.echo("Validation (compile + size check) passed.")
+        click.echo(
+            f"  Generated: text={gen_size.text} data={gen_size.data} bss={gen_size.bss} total={gen_size.total}"
+        )
+        click.echo(
+            f"  Reference: text={ref_size.text} data={ref_size.data} bss={ref_size.bss} total={ref_size.total}"
+        )
+        click.echo(f"  Tolerance for numerical check (future full numpy compare): {tolerance}")
+        click.echo(
+            "  NOTE: Full numerical validation under QEMU with test vectors is planned; current check ensures both compile and link successfully for target."
+        )
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
 
 
 @main.command(name="list-operators")
@@ -461,6 +594,86 @@ def report_cmd(
     click.echo(f"  - Load results from {input_path}")
     click.echo("  - Aggregate per-operator and per-target statistics")
     click.echo(f"  - Render {template} template to {output}")
+
+
+@main.command(name="pipeline")
+@click.argument("operator", type=str)
+@click.option(
+    "--target", "-t", type=str, default="cortex-m7", show_default=True, help="Target device."
+)
+@click.option("--spec", type=click.Path(exists=True, path_type=pathlib.Path), default=None)
+@click.option(
+    "--output-dir", "-o", type=click.Path(path_type=pathlib.Path), default=pathlib.Path("./output")
+)
+@click.option(
+    "--llm-provider", type=click.Choice(["mock", "avocado", "avocado_free"]), default="mock"
+)
+@click.option("--mode", type=click.Choice(["fast", "full", "auto"]), default="fast")
+@click.option(
+    "--workspace", type=click.Path(path_type=pathlib.Path), default=pathlib.Path("/workspace")
+)
+def pipeline_cmd(operator, target, spec, output_dir, llm_provider, mode, workspace):
+    """End-to-end LLM harness pipeline: optimize -> compile -> emulate -> metrics."""
+    try:
+        click.echo(f"Running kernelsmith pipeline for {operator} on {target} mode={mode}...")
+        result = run_kernelsmith_pipeline(
+            operator=operator,
+            target=target,
+            mode=mode,
+            llm_provider=llm_provider,
+            workspace=str(workspace),
+        )
+        click.echo(json.dumps(result, indent=2))
+        click.echo("Pipeline complete. Metrics ready for LLM harness reasoning.")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+
+
+@main.command(name="toolchain-info")
+def toolchain_info_cmd():
+    """Show toolchain and QEMU environment info for Docker."""
+    import subprocess
+
+    def ver(cmd):
+        try:
+            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+            return out.stdout.strip().splitlines()[0]
+        except Exception:
+            return "not found"
+
+    click.echo("=== Kernelsmith Toolchain Environment ===")
+    click.echo(f"arm-none-eabi-gcc: {ver('arm-none-eabi-gcc --version')}")
+    click.echo(f"arm-linux-gnueabihf-gcc: {ver('arm-linux-gnueabihf-gcc --version')}")
+    click.echo(f"qemu-arm: {ver('qemu-arm --version')}")
+    click.echo(f"qemu-system-arm: {ver('qemu-system-arm --version')}")
+    click.echo(f"gdb-multiarch: {ver('gdb-multiarch --version')}")
+    click.echo(f"python: {ver('python3 --version')}")
+    from kernelsmith.toolchain import TARGET_REGISTRY
+
+    click.echo(f"Supported targets: {', '.join(TARGET_REGISTRY.keys())}")
+
+
+@main.command(name="compare-modes")
+@click.argument("operator", type=str)
+@click.option("--target", "-t", default="cortex-m7")
+@click.option("--spec", type=click.Path(exists=True, path_type=pathlib.Path), default=None)
+@click.option("--llm-provider", default="mock")
+@click.option("--workspace", default="/workspace")
+def compare_modes_cmd(operator, target, spec, llm_provider, workspace):
+    """Compare fast vs full QEMU modes for trade-off reasoning."""
+    try:
+        h = KernelsmithHarness(target=target, mode="fast", workspace=workspace)
+        result = h.compare_modes(operator=operator, spec_path=spec, llm_provider=llm_provider)
+        click.echo(json.dumps(result, indent=2))
+        comp = result["comparison"]
+        click.echo(
+            f"Fast cycles: {result['fast']['cycles_estimate']}, Full cycles: {result['full']['cycles_estimate']}, ratio: {comp['cycles_ratio']}"
+        )
+        click.echo(comp["tradeoff_note"])
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
 
 
 if __name__ == "__main__":

@@ -75,22 +75,71 @@ All commands currently print TODO messages describing future behavior (initial s
 
 ## Docker
 
-Builds with ARM toolchain:
+Enhanced Docker environment with cross-toolchain per target and QEMU emulation for metrics collection. See `docker/README.md` for full details.
+
+Builds with ARM toolchain and QEMU user+system:
 
 ```bash
 docker build -t kernelsmith .
-docker run --rm kernelsmith --help
-docker run --rm kernelsmith list-operators
-docker run --rm -v $PWD:/app -w /app kernelsmith optimize --operator examples/operators/relu.yaml --target examples/hardware/cortex-m7.yaml
+# or
+./docker/build.sh
+# or
+docker compose build
 ```
 
 Toolchain verification:
 
 ```bash
+docker run --rm kernelsmith toolchain-info
 docker run --rm kernelsmith arm-none-eabi-gcc --version
 docker run --rm kernelsmith qemu-system-arm --version
 docker run --rm kernelsmith qemu-arm --version
 ```
+
+Quick start end-to-end pipeline inside Docker:
+
+```bash
+# LLM generate -> compile -> emulate -> metrics
+docker run --rm -v $PWD:/workspace -w /workspace kernelsmith pipeline relu --target cortex-m7 --llm-provider mock --mode fast
+
+# Benchmark existing kernel with metrics
+docker run --rm -v $PWD:/workspace -w /workspace kernelsmith benchmark --kernel reference/naive/relu.c --target-name cortex-m7 --mode fast -o results.json
+cat results.json
+
+# Compare fast vs full QEMU modes for trade-off reasoning
+docker run --rm -v $PWD:/workspace -w /workspace kernelsmith compare-modes relu --target cortex-m7 --llm-provider mock
+
+# Validate compilation
+docker run --rm -v $PWD:/workspace -w /workspace kernelsmith validate --generated output/ks_relu_cortex_m7.c --reference reference/naive/relu.c --operator examples/operators/relu.yaml --target-name cortex-m7
+```
+
+Docker Compose:
+
+```bash
+docker compose run --rm kernelsmith pipeline relu --target cortex-m7 --llm-provider mock --mode fast
+docker compose run --rm kernelsmith benchmark --kernel reference/naive/relu.c --target-name cortex-m7 --mode full -o /workspace/results.json
+```
+
+**QEMU modes:**
+- `fast` = instruction accurate via `qemu-arm -d in_asm`, quick iteration for LLM harness inner loop
+- `full` = cycle approximate via qemu-system with ~15% simulated overhead for pipeline/cache, realistic MCU timing
+- `auto` = fast
+
+**Metrics output** includes cycles_estimate, time_us, instruction_count, text/data/bss bytes, total_bytes, mode, target, toolchain flags.
+
+**LLM harness integration** Python API:
+
+```python
+from kernelsmith.harness import run_kernelsmith_pipeline, KernelsmithHarness
+
+result = run_kernelsmith_pipeline("relu", target="cortex-m7", mode="fast", llm_provider="avocado_free")
+print(result["metrics"])
+
+h = KernelsmithHarness(target="cortex-m7")
+comparison = h.compare_modes("relu", llm_provider="mock")
+```
+
+See `examples/harness_integration.py` and `docker/README.md`.
 
 ## CI
 
