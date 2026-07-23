@@ -1,8 +1,22 @@
-import pathlib
 import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
 
 import click
 import yaml
+
+# Try to import rich-based animated UI
+try:
+    from kernelsmith import cli_ui
+
+    _has_cli_ui = True
+except ImportError:
+    _has_cli_ui = False
+    cli_ui = None
 
 from kernelsmith import __version__
 from kernelsmith.codegen.optimize import optimize as optimize_fn
@@ -10,15 +24,507 @@ from kernelsmith.codegen.prompt_builder import (
     list_builtin_targets,
     resolve_hardware_profile,
 )
+from kernelsmith.emulator import emulate
+from kernelsmith.harness import KernelsmithHarness, run_kernelsmith_pipeline
+from kernelsmith.metrics import collect_metrics
 from kernelsmith.toolchain import (
-    resolve_toolchain,
-    compile_c_to_elf,
     compile_baremetal_system_elf,
+    compile_c_to_elf,
+    resolve_toolchain,
     toolchain_available,
 )
-from kernelsmith.emulator import emulate
-from kernelsmith.metrics import collect_metrics, compare_fast_vs_full
-from kernelsmith.harness import KernelsmithHarness, run_kernelsmith_pipeline
+
+# ------------------------------------------------------------------
+# Auto-Docker helpers for smooth UX (user runs `kernelsmith e2e ...` and it auto-runs in Docker if needed)
+# ------------------------------------------------------------------
+
+
+def _is_docker_available() -> bool:
+    return shutil.which("docker") is not None
+
+
+def _find_docker_image(preferred: list[str] | None = None) -> str | None:
+    """Find available kernelsmith docker image, returns image name or None.
+
+    For smooth UX and fast detection on macOS Docker Desktop, we avoid slow `docker images` calls
+    by default and return first candidate if docker is available. The docker run will fail quickly
+    if image not present, and we handle that with a nice message.
+    """
+    candidates = preferred or [
+        os.getenv("KERNELSMITH_DOCKER_IMAGE", ""),
+        "kernelsmith:test",
+        "kernelsmith",
+        "kernelsmith:latest",
+    ]
+    # Filter empty
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return None
+
+    # Fast path: if docker available, return first candidate immediately for smooth UX
+    # The actual docker run will validate existence. This avoids slow `docker images -q` on macOS.
+    if _is_docker_available():
+        # Optionally try a quick check with longer timeout, but don't block too long
+        # Try to be helpful: if user set KERNELSMITH_DOCKER_IMAGE, respect it
+        explicit = os.getenv("KERNELSMITH_DOCKER_IMAGE")
+        if explicit:
+            return explicit
+        # Return first candidate that likely exists (kernelsmith:test preferred for dev)
+        return candidates[0]
+
+    return None
+
+
+def _build_docker_run_cmd(
+    docker_image: str,
+    workspace_host: pathlib.Path,
+    inner_command: list[str],
+    env_vars: list[str] | None = None,
+    extra_mounts: list[tuple[pathlib.Path, str]] | None = None,
+) -> list[str]:
+    """
+    Build docker run command that mounts workspace_host as /workspace and runs inner_command.
+
+    inner_command is like ["e2e", "relu", "--target", "cortex-m7", ...]
+    """
+    env_vars = env_vars or [
+        "KERNELSMITH_MODEL_API_KEY",
+        "KERNELSMITH_MODEL_API_BASE",
+        "KERNELSMITH_DOCKER_IMAGE",
+    ]
+    # Ensure workspace_host exists and is absolute
+    workspace_host = workspace_host.resolve()
+    # Use -t for TTY if host is TTY to enable spinner animation, plus -i for interactive
+    # For smooth agentic UX, we want animation, so include -t when possible
+    tty_flags = []
+    try:
+        if sys.stdout.isatty():
+            tty_flags = ["-t"]
+    except Exception:
+        pass
+    cmd = ["docker", "run", "--rm"] + tty_flags
+
+    # Forward env vars if set
+    for ev in env_vars:
+        if os.getenv(ev):
+            cmd.extend(["-e", ev])
+
+    # Always set inside-docker marker to prevent recursion and force rich animation
+    cmd.extend(["-e", "KERNELSMITH_INSIDE_DOCKER=1"])
+    cmd.extend(["-e", "KERNELSMITH_FORCE_RICH=1"])
+
+    # Mount workspace
+    cmd.extend(["-v", f"{workspace_host}:/workspace"])
+    cmd.extend(["-w", "/workspace"])
+
+    # Extra mounts (for absolute paths outside workspace)
+    if extra_mounts:
+        for host_path, container_path in extra_mounts:
+            try:
+                host_path = pathlib.Path(host_path).resolve()
+                if host_path.exists():
+                    cmd.extend(["-v", f"{host_path}:{container_path}"])
+            except Exception:
+                continue
+
+    cmd.append(docker_image)
+    # Use kernelsmith entrypoint - it already handles e2e etc
+    cmd.extend(inner_command)
+    return cmd
+
+
+def _run_in_docker_if_needed(
+    command_args: list[str],
+    workspace_host: pathlib.Path | None = None,
+    docker_image: str | None = None,
+    force_docker: bool = False,
+    auto_docker: bool = True,
+) -> bool:
+    """
+    Attempt to auto-run the given kernelsmith command inside Docker if toolchain missing or force_docker.
+
+    Returns True if Docker was invoked (and this process should exit after), False if not.
+
+    command_args: list like ["e2e", "relu", "--target", "cortex-m7", ...]
+    workspace_host: host workspace to mount, defaults to cwd
+    docker_image: optional explicit image
+    force_docker: if True, always use Docker even if toolchain available
+    auto_docker: if False, never auto-use Docker (respects --no-docker)
+    """
+    if not auto_docker:
+        return False
+
+    if not _is_docker_available():
+        return False
+
+    # If not forced and toolchain is available, don't use Docker (fast path)
+    if not force_docker:
+        try:
+            from kernelsmith.toolchain import (
+                linux_toolchain_available,
+                resolve_toolchain,
+                toolchain_available,
+            )
+
+            # Try to resolve for target if present in args
+            target = "cortex-m7"
+            if "--target" in command_args or "-t" in command_args:
+                try:
+                    idx = (
+                        command_args.index("--target")
+                        if "--target" in command_args
+                        else command_args.index("-t")
+                    )
+                    target = command_args[idx + 1]
+                except Exception:
+                    pass
+            tc = resolve_toolchain(target)
+            has_baremetal = toolchain_available(tc.compiler)
+            linux_toolchain_available()
+            has_qemu = shutil.which("qemu-arm") or shutil.which("qemu-arm-static")
+            if has_baremetal and has_qemu:
+                # Toolchain available locally, no need Docker
+                return False
+        except Exception:
+            # If any error resolving, fall through to Docker path
+            pass
+
+    # Find docker image
+    if docker_image:
+        image = docker_image
+    else:
+        image = _find_docker_image()
+        if not image:
+            click.secho(
+                "Docker available but no kernelsmith image found (tried kernelsmith:test, kernelsmith). "
+                "Build one via: docker build -t kernelsmith -f Dockerfile .",
+                fg="yellow",
+            )
+            return False
+
+    workspace_host = workspace_host or pathlib.Path.cwd()
+
+    # Build docker command
+    docker_cmd = _build_docker_run_cmd(
+        docker_image=image,
+        workspace_host=workspace_host,
+        inner_command=command_args,
+    )
+
+    click.secho("", fg="cyan")
+    click.secho(
+        f"Toolchain not found locally, auto-running inside Docker image {image}...",
+        fg="cyan",
+        bold=True,
+    )
+    click.secho(f"  Host workspace: {workspace_host} -> /workspace in container", fg="cyan")
+    click.secho(f"  Docker command: {' '.join(docker_cmd)}", fg="cyan")
+    click.secho("", fg="cyan")
+
+    try:
+        # Stream output directly to terminal
+        result = subprocess.run(docker_cmd)
+        # Exit with same code as docker run
+        sys.exit(result.returncode)
+    except KeyboardInterrupt:
+        click.echo("Docker run interrupted", err=True)
+        sys.exit(130)
+    except Exception as e:
+        click.echo(f"Failed to run in Docker: {e}", err=True)
+        return False
+
+    return True
+
+
+# ------------------------------------------------------------------
+# Logging helpers for good failure logs and final report
+# ------------------------------------------------------------------
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    return f"{seconds:.1f}s"
+
+
+def _log_step_start(step_num: int, total: int, name: str, detail: str = ""):
+    msg = f"[{step_num}/{total}] {name}..."
+    if detail:
+        msg += f" {detail}"
+    click.secho(msg, fg="cyan")
+
+
+def _log_step_detail(msg: str):
+    click.echo(f"      → {msg}")
+
+
+def _log_step_success(step_num: int, name: str, duration: float, detail: str = ""):
+    dur_str = _format_duration(duration)
+    msg = f"      ✓ {name} in {dur_str}"
+    if detail:
+        msg += f" - {detail}"
+    click.secho(msg, fg="green")
+
+
+def _log_failure_block(
+    step_label: str,
+    context: str = "",
+    error: str = "",
+    details: str = "",
+    suggestions: str = "",
+    artifacts: str = "",
+):
+    # Try rich first
+    if _has_cli_ui:
+        try:
+            if cli_ui.print_failure_rich(
+                step_label, context, error, details, suggestions, artifacts
+            ):
+                return
+        except Exception:
+            pass
+    click.secho("", err=True)
+    click.secho("=" * 60, fg="red", err=True)
+    click.secho(f"  ✗ FAILURE at {step_label}", fg="red", bold=True, err=True)
+    click.secho("=" * 60, fg="red", err=True)
+    if context:
+        click.secho(f"Context: {context}", err=True)
+    if error:
+        click.secho(f"Error: {error}", fg="red", err=True)
+    if details:
+        # Truncate details if too long but keep enough for debugging
+        truncated = details[:5000] + ("... (truncated)" if len(details) > 5000 else "")
+        click.echo(f"Details:\n{truncated}", err=True)
+    if suggestions:
+        click.secho(f"Suggestions:\n{suggestions}", fg="yellow", err=True)
+    if artifacts:
+        click.echo(f"Artifacts: {artifacts}", err=True)
+    click.secho("=" * 60, fg="red", err=True)
+    click.secho("", err=True)
+
+
+def _print_e2e_success_report(result_dict: dict, verbose: bool = False, quiet: bool = False):
+    """Nice final report printed after successful E2E run - now with rich animated UI."""
+    # Try rich animated UI first (agentic coding tool style)
+    if _has_cli_ui:
+        try:
+            cli_ui.print_final_report_rich(result_dict, verbose=verbose, quiet=quiet)
+            return
+        except Exception:
+            pass
+
+    op = result_dict.get("operator", "unknown")
+    tgt = result_dict.get("target", "unknown")
+    mode = result_dict.get("mode", "fast")
+    provider = result_dict.get("llm_provider", "unknown")
+    model = result_dict.get("model", "unknown")
+
+    validation = result_dict.get("validation", {}) or {}
+    metrics = result_dict.get("metrics", {}) or {}
+    emulation = result_dict.get("emulation", {}) or {}
+    artifacts = result_dict.get("artifacts", {}) or {}
+    timing = result_dict.get("timing", {}) or {}
+    steps = result_dict.get("steps", [])
+
+    total_time = timing.get("total", 0)
+    # Fallback sum if total missing
+    if total_time == 0 and steps:
+        total_time = sum(s.get("duration_s", 0) for s in steps)
+
+    click.secho("", fg="green")
+    click.secho("=" * 70, fg="green")
+    click.secho("  Kernelsmith E2E Report ✓ PASSED", fg="green", bold=True)
+    click.secho("=" * 70, fg="green")
+    click.echo(f"Operator:       {op}")
+    click.echo(f"Target:         {tgt}")
+    click.echo(f"Mode:           {mode}")
+    click.echo(f"LLM Provider:   {provider} (model={model})")
+    click.echo(f"Timing Total:   {_format_duration(total_time)}")
+    click.echo("")
+
+    click.secho("Steps:", fg="cyan", bold=True)
+    for i, s in enumerate(steps, 1):
+        name = s.get("name", f"step{i}")
+        dur = s.get("duration_s", 0)
+        success = s.get("success", True)
+        details = s.get("details", "")
+        status_icon = "✓" if success else "✗"
+        color = "green" if success else "red"
+        click.secho(f"  [{status_icon}] {i}. {name} ({_format_duration(dur)})", fg=color)
+        if details and verbose:
+            click.echo(f"       {details}")
+
+    click.echo("")
+    click.secho("Validation:", fg="cyan", bold=True)
+    compile_ok = validation.get("compile_success", validation.get("passed", False))
+    # Try to get from validation dict directly if it's ValidationResult.to_dict
+    if "passed" in validation:
+        validation.get("passed", False)
+        failed_step = validation.get("failed_step", "none")
+        click.echo(f"  Compile:      {'PASS' if compile_ok else 'FAIL'}")
+        # correctness from validation
+        corr = validation.get("correctness_passed", validation.get("passed", False))
+        click.echo(f"  Correctness:  {'PASS' if corr else 'FAIL'}")
+        click.echo(f"  Failed Step:  {failed_step or 'none'}")
+        # Counts if available in performance_metrics
+        (
+            result_dict.get("validation", {}).get("performance_metrics", {})
+            if isinstance(result_dict.get("validation"), dict)
+            else {}
+        )
+        # Actually validation dict may be nested; try to get counts from metrics
+        pass_count = metrics.get("validation_pass_count") if metrics else None
+        fail_count = metrics.get("validation_fail_count") if metrics else None
+        if pass_count is not None or fail_count is not None:
+            click.echo(f"  Cases:        {pass_count or '?'} PASS, {fail_count or 0} FAIL")
+        details_snippet = validation.get("details", "")[:500]
+        if details_snippet:
+            click.echo("  Details Snippet:")
+            for line in details_snippet.splitlines()[:10]:
+                click.echo(f"    {line}")
+    else:
+        click.echo(f"  Passed: {validation.get('passed', 'unknown')}")
+
+    click.echo("")
+    click.secho("Metrics:", fg="cyan", bold=True)
+    if metrics:
+        text_b = metrics.get("text_bytes", metrics.get("text_bytes", "?"))
+        total_b = metrics.get("total_bytes", "?")
+        cycles = metrics.get("cycles_estimate", "?")
+        time_us = metrics.get("time_us", "?")
+        instr = metrics.get("instruction_count", "?")
+        click.echo(f"  Size:         text={text_b} total={total_b} bytes")
+        click.echo(f"  Cycles:       {cycles} est. ({mode} mode)")
+        click.echo(f"  Time:         {time_us} us")
+        click.echo(f"  Instr Count:  {instr}")
+        if mode == "fast":
+            click.echo("  Note:         Full mode ~15% higher for pipeline/cache overhead")
+    else:
+        click.echo("  Metrics: not available (baremetal compile skipped?)")
+
+    click.echo("")
+    click.secho("Emulation:", fg="cyan", bold=True)
+    if emulation:
+        click.echo(f"  Mode: {emulation.get('mode', mode)}")
+        click.echo(f"  Returncode: {emulation.get('returncode', '?')}")
+        stdout_snip = emulation.get("stdout", "")[:300]
+        if stdout_snip:
+            click.echo(f"  Output Snippet: {stdout_snip[:200]}...")
+    else:
+        click.echo("  Emulation: no data")
+
+    # ------------------------------------------------------------------
+    # New: Naive vs Optimized comparison (per user request)
+    # ------------------------------------------------------------------
+    naive_metrics = result_dict.get("naive_metrics") or {}
+    optimized_metrics = result_dict.get("optimized_metrics") or {}
+    comparison = result_dict.get("comparison") or {}
+
+    if naive_metrics and optimized_metrics and comparison:
+        click.echo("")
+        click.secho("=" * 70, fg="magenta")
+        click.secho("  Performance Comparison: Naive vs Optimized", fg="magenta", bold=True)
+        click.secho("=" * 70, fg="magenta")
+
+        # Prepare table header
+        click.echo(f"{'Metric':<20} {'Naive':<15} {'Optimized':<15} {'Gain':<25}")
+        click.echo("-" * 70)
+
+        def _format_gain(comp_entry: dict | None, is_size_or_time: bool = True) -> str:
+            if not comp_entry:
+                return "N/A"
+            comp_entry.get("naive", 0)
+            comp_entry.get("optimized", 0)
+            delta = comp_entry.get("delta", 0)
+            delta_pct = comp_entry.get("delta_pct", 0)
+            speedup = comp_entry.get("speedup", 1.0)
+            improved = comp_entry.get("improved", False)
+
+            if is_size_or_time:
+                # For size/time/cycles, lower is better
+                if improved:
+                    return f"{delta:+.0f} ({delta_pct:+.1f}%) {speedup:.2f}x faster ✓"
+                else:
+                    return f"{delta:+.0f} ({delta_pct:+.1f}%) {speedup:.2f}x slower"
+            else:
+                return f"{delta:+.0f} ({delta_pct:+.1f}%)"
+
+        for metric_key in [
+            "text_bytes",
+            "total_bytes",
+            "time_us",
+            "cycles_estimate",
+            "instruction_count",
+        ]:
+            comp_entry = comparison.get(metric_key)
+            if comp_entry:
+                naive_val = comp_entry.get("naive", 0)
+                opt_val = comp_entry.get("optimized", 0)
+                gain_str = _format_gain(comp_entry, is_size_or_time=True)
+                # Color based on improved
+                color = (
+                    "green"
+                    if comp_entry.get("improved")
+                    else "yellow"
+                    if comp_entry.get("delta") == 0
+                    else "red"
+                )
+                click.secho(
+                    f"{metric_key:<20} {naive_val:<15} {opt_val:<15} {gain_str:<25}", fg=color
+                )
+            else:
+                # Fallback try direct metrics
+                n_val = naive_metrics.get(metric_key, "?")
+                o_val = optimized_metrics.get(metric_key, "?")
+                click.echo(f"{metric_key:<20} {n_val:<15} {o_val:<15} {'N/A':<25}")
+
+        # Summary
+        summary = comparison.get("summary", {})
+        if summary:
+            click.echo("")
+            click.secho("Summary:", fg="cyan", bold=True)
+            for k, v in summary.items():
+                click.echo(f"  {k}: {v}")
+
+        # Additional detailed naive vs optimized metrics
+        if verbose:
+            click.echo("")
+            click.secho("Detailed Naive Metrics:", fg="cyan")
+            for k, v in naive_metrics.items():
+                if k not in ("benchmark",):
+                    click.echo(f"  naive {k}: {v}")
+            click.secho("Detailed Optimized Metrics:", fg="cyan")
+            for k, v in optimized_metrics.items():
+                if k not in ("benchmark",):
+                    click.echo(f"  optimized {k}: {v}")
+
+        click.secho("=" * 70, fg="magenta")
+
+    click.echo("")
+    click.secho("Artifacts:", fg="cyan", bold=True)
+    for k, v in artifacts.items():
+        if v:
+            click.echo(f"  {k}: {v}")
+    generated = result_dict.get("generated", {})
+    for k, v in generated.items():
+        if v:
+            click.echo(f"  Generated {k}: {v}")
+    # Also show reference (naive) path
+    ref_path = result_dict.get("reference")
+    if ref_path:
+        click.echo(f"  Reference (naive): {ref_path}")
+
+    results_json = result_dict.get("results_json", "")
+    if results_json:
+        click.echo(f"  Results JSON: {results_json}")
+
+    click.echo("")
+    click.secho(f"Results written to: {results_json}", fg="green")
+    click.secho(
+        "Status: PASSED ✓ - Ready for benchmark/compare or downstream use", fg="green", bold=True
+    )
+    click.secho("=" * 70, fg="green")
+    click.secho("", fg="green")
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -27,7 +533,263 @@ def main() -> None:
     """Kernelsmith - generates optimized C code for ARM Cortex-M7."""
 
 
-@main.command(name="optimize")
+# --- SWE-bench task generation (single CLI group per user request) ---
+# Only `swe-bench` group is kept; `task` alias removed.
+
+
+def _register_task_commands(group):
+    """Register draft and assemble commands on a click group."""
+
+    @group.command(name="draft")
+    @click.argument("operator", type=str)
+    @click.option(
+        "--target",
+        "-t",
+        "target_name",
+        type=str,
+        required=True,
+        help="Target device (e.g., cortex-m7).",
+    )
+    @click.option(
+        "--naive",
+        "naive_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        required=True,
+        help="Path to naive baseline C file.",
+    )
+    @click.option(
+        "--gold",
+        "gold_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        required=True,
+        help="Path to gold optimized C file (human-verified).",
+    )
+    @click.option(
+        "--measured-costs",
+        "costs_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        default=None,
+        help="JSON with naive_cost, gold_cost, cost_metric (W2 fallback).",
+    )
+    @click.option(
+        "--kernelsmith-repo",
+        "ks_repo",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        default=None,
+        help="Path to kernelsmith repo root (for operator/HW YAML discovery).",
+    )
+    @click.option(
+        "--approve",
+        is_flag=True,
+        default=False,
+        help="Auto-approve human authorship gate (CI mode).",
+    )
+    @click.option(
+        "--output-dir",
+        "-o",
+        "output_dir",
+        type=click.Path(path_type=pathlib.Path),
+        default=pathlib.Path("./staging"),
+        show_default=True,
+        help="Staging output directory.",
+    )
+    @click.option(
+        "--template",
+        "template_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        default=None,
+        help="Custom instruction.md.j2 template override.",
+    )
+    def draft_cmd(
+        operator: str,
+        target_name: str,
+        naive_path: pathlib.Path,
+        gold_path: pathlib.Path,
+        costs_path: pathlib.Path | None,
+        ks_repo: pathlib.Path | None,
+        approve: bool,
+        output_dir: pathlib.Path,
+        template_path: pathlib.Path | None,
+    ) -> None:
+        """Draft instruction.md from deterministic template + costs."""
+        from kernelsmith.taskgen.draft import draft_pipeline
+
+        rc = draft_pipeline(
+            operator=operator,
+            target=target_name,
+            naive_path=naive_path,
+            gold_path=gold_path,
+            output_dir=output_dir,
+            measured_costs_path=costs_path,
+            kernelsmith_repo=ks_repo,
+            approve=approve,
+            template_path=template_path,
+        )
+        sys.exit(rc)
+
+    @group.command(name="assemble")
+    @click.option(
+        "--staging",
+        "staging_dir",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        required=True,
+        help="Staging dir from draft (contains instruction.md + .taskgen-meta.json).",
+    )
+    @click.option(
+        "--naive",
+        "naive_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        required=True,
+        help="Path to naive baseline C file.",
+    )
+    @click.option(
+        "--gold",
+        "gold_path",
+        type=click.Path(exists=True, path_type=pathlib.Path),
+        required=True,
+        help="Path to gold optimized C file.",
+    )
+    @click.option(
+        "--operator",
+        "operator_name",
+        type=str,
+        required=True,
+        help="Operator name (e.g., relu).",
+    )
+    @click.option(
+        "--target",
+        "target_name",
+        type=str,
+        required=True,
+        help="Target device (e.g., cortex-m7).",
+    )
+    @click.option(
+        "--kernelsmith-repo",
+        "ks_repo",
+        type=click.Path(path_type=pathlib.Path),
+        default=None,
+        help="Path to kernelsmith repo root.",
+    )
+    @click.option(
+        "--task-repo",
+        "task_repo",
+        type=click.Path(path_type=pathlib.Path),
+        required=True,
+        help="Path to codimango task repo (or temp dir for dry-run).",
+    )
+    @click.option(
+        "--task-name",
+        "task_name",
+        type=str,
+        default=None,
+        help="Task name, e.g., codimango/kernelsmith-relu-cortex-m7-v1. Auto-generated if omitted.",
+    )
+    @click.option(
+        "--force",
+        is_flag=True,
+        default=False,
+        help="Overwrite existing task folder.",
+    )
+    @click.option(
+        "--push",
+        is_flag=True,
+        default=False,
+        help="Push base commit to remote (use only for real submit).",
+    )
+    def assemble_cmd(
+        staging_dir: pathlib.Path,
+        naive_path: pathlib.Path,
+        gold_path: pathlib.Path,
+        operator_name: str,
+        target_name: str,
+        ks_repo: pathlib.Path | None,
+        task_repo: pathlib.Path,
+        task_name: str | None,
+        force: bool,
+        push: bool,
+    ) -> None:
+        """Assemble codimango task folder from staging + naive/gold."""
+        from kernelsmith.taskgen.assemble import assemble_pipeline
+
+        if task_name is None:
+            op_norm = operator_name.replace("-", "_").lower()
+            tgt_dash = target_name.lower()
+            task_name = f"kernelsmith-{op_norm}-{tgt_dash}-v1"
+
+        rc = assemble_pipeline(
+            staging_dir=staging_dir,
+            naive_path=naive_path,
+            gold_path=gold_path,
+            operator=operator_name,
+            target=target_name,
+            task_repo=task_repo,
+            task_name=task_name,
+            kernelsmith_repo=ks_repo,
+            force=force,
+            push=push,
+        )
+        sys.exit(rc)
+
+
+@main.group(name="swe-bench")
+def swe_bench_group() -> None:
+    """SWE-bench task generation pipeline (draft + assemble)."""
+
+
+_register_task_commands(swe_bench_group)
+
+
+def _do_oneshot(
+    operator: str,
+    target_name: str,
+    spec_path: pathlib.Path | None,
+    output_dir: pathlib.Path,
+    llm_provider: str,
+    template: pathlib.Path | None,
+    model: str | None,
+    dev: bool,
+    optimization_mode: str | None = None,
+) -> None:
+    """Old one-shot logic — now exposed as `oneshot` command, previous `optimize` behavior."""
+    operator = operator.lower()
+    target_name = target_name.lower()
+    effective_model = model
+    if effective_model is None:
+        effective_model = "avocado_metacode_rc"
+    # For oneshot, we should pass --optimization_mode oneshot per design hint
+    if optimization_mode is None:
+        optimization_mode = "oneshot"
+    try:
+        result = optimize_fn(
+            operator=operator,
+            target=target_name,
+            spec_path=spec_path,
+            output_dir=output_dir,
+            llm_provider_name=llm_provider,
+            template_path=template,
+            model=effective_model,
+            dev=dev,
+            optimization_mode=optimization_mode,
+        )
+        click.echo(f"Generated files for {operator} ({target_name}):")
+        click.echo(f"  Header: {result.files.header_path}")
+        click.echo(f"  Implementation: {result.files.c_path}")
+        click.echo(f"  Reasoning: {result.files.md_path}")
+        click.echo(f"  Model: {result.model}")
+        click.echo(f"  Operator spec: {result.operator_path}")
+        click.echo(f"  Hardware profile: {result.target_path}")
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+    except Exception as e:
+        click.echo(f"Unexpected error: {e}", err=True)
+        raise click.Abort() from e
+
+
+@main.command(name="oneshot")
 @click.argument("operator", type=str)
 @click.option(
     "--target",
@@ -83,7 +845,15 @@ def main() -> None:
     hidden=True,
     help="Deprecated: use --llm-provider avocado_free.",
 )
-def optimize_cmd(
+@click.option(
+    "--optimization-mode",
+    "optimization_mode",
+    type=str,
+    default="oneshot",
+    show_default=True,
+    help="Optimization mode: oneshot for single candidate (default for oneshot cmd).",
+)
+def oneshot_cmd(
     operator: str,
     target_name: str,
     spec_path: pathlib.Path | None,
@@ -92,124 +862,809 @@ def optimize_cmd(
     template: pathlib.Path | None,
     model: str | None,
     dev: bool,
+    optimization_mode: str,
 ) -> None:
-    """Generate optimized C kernel for OPERATOR and target.
+    """One-shot optimized C kernel (previous `optimize` behavior).
 
-    Example: kernelsmith optimize relu --target cortex-m7 --output-dir ./output
+    Now `optimize` defaults to evolutionary search (simple CLI, parallel Docker behind scenes).
+    This `oneshot` command preserves old single-candidate flow and passes --optimization_mode oneshot.
+
+    Example: kernelsmith oneshot relu --target cortex-m7 --output-dir ./output --optimization-mode oneshot
     """
-    operator = operator.lower()
-    target_name = target_name.lower()
-    effective_model = model
-    if effective_model is None:
-        effective_model = "avocado_metacode_rc"
-    try:
-        result = optimize_fn(
-            operator=operator,
-            target=target_name,
-            spec_path=spec_path,
-            output_dir=output_dir,
-            llm_provider_name=llm_provider,
-            template_path=template,
-            model=effective_model,
-            dev=dev,
-        )
-        click.echo(f"Generated files for {operator} ({target_name}):")
-        click.echo(f"  Header: {result.files.header_path}")
-        click.echo(f"  Implementation: {result.files.c_path}")
-        click.echo(f"  Reasoning: {result.files.md_path}")
-        click.echo(f"  Model: {result.model}")
-        click.echo(f"  Operator spec: {result.operator_path}")
-        click.echo(f"  Hardware profile: {result.target_path}")
-    except FileNotFoundError as e:
-        click.echo(f"Error: {e}", err=True)
-        raise click.Abort() from e
-    except RuntimeError as e:
-        click.echo(f"Error: {e}", err=True)
-        raise click.Abort() from e
-    except Exception as e:
-        click.echo(f"Unexpected error: {e}", err=True)
-        raise click.Abort() from e
+    _do_oneshot(
+        operator,
+        target_name,
+        spec_path,
+        output_dir,
+        llm_provider,
+        template,
+        model,
+        dev,
+        optimization_mode,
+    )
 
 
 @main.command(name="generate")
-@click.argument("operator", type=str)
+@click.argument("operator", type=str, required=False, default="relu")
 @click.option(
     "--target",
     "-t",
     "target_name",
     type=str,
-    required=True,
+    default="cortex-m7",
+    show_default=True,
     help="Target device (e.g., cortex-m7).",
 )
 @click.option(
-    "--spec",
-    "spec_path",
+    "--config",
+    "config_path",
     type=click.Path(exists=True, path_type=pathlib.Path),
     default=None,
-    help="User-provided operator spec YAML.",
+    help="Delta.yaml for overriding base.yaml defaults (deep merge).",
+)
+@click.option(
+    "--optimize",
+    "optimize_flag",
+    type=str,
+    default=None,
+    help="Optimize focus: cycles, memory, code_size, all, or omit for Pareto.",
 )
 @click.option(
     "--output-dir",
     "-o",
     "output_dir",
     type=click.Path(path_type=pathlib.Path),
-    default=pathlib.Path("./output"),
-    show_default=True,
-    help="Output directory.",
+    default=None,
+    help="Output dir (default: output/evolve/<op>_<target>_<run_id>/ with generations).",
 )
 @click.option(
     "--llm-provider",
-    "--provider",
     "llm_provider",
     type=click.Choice(["mock", "avocado", "avocado_free"]),
-    default="avocado_free",
+    default="mock",
     show_default=True,
-    help="LLM provider: avocado_free=free (default), avocado=prod soon, mock=offline.",
+    help="LLM provider: mock for CI, avocado_free for real.",
+)
+@click.option("--model", type=str, default=None, help="Override LLM model from base.yaml.")
+@click.option("--verbose", is_flag=True, default=False, help="Verbose logging per step.")
+@click.option(
+    "--gen0-size",
+    type=int,
+    default=None,
+    help="Override gen0_size from config (e.g., 2 for fast test).",
 )
 @click.option(
-    "--template",
+    "--gen-n-size",
+    "gen_n_size",
+    type=int,
+    default=None,
+    help="Override gen_n_size (population size gen>=1) from config.",
+)
+@click.option(
+    "--max-generations", type=int, default=None, help="Override max_generations (K) from config."
+)
+@click.option(
+    "--parallel-calls",
+    "parallel_calls",
+    type=int,
+    default=None,
+    help="Override LLM parallel calls (e.g., 8 for 8 parallel LLM workers).",
+)
+@click.option(
+    "--qemu-workers",
+    "qemu_workers",
+    type=int,
+    default=None,
+    help="Override QEMU/Docker parallel workers (e.g., 8 for 8 parallel docker+QEMU).",
+)
+@click.option(
+    "--spec",
+    "spec_path",
     type=click.Path(exists=True, path_type=pathlib.Path),
     default=None,
-    help="Custom template.",
-)
-@click.option(
-    "--model",
-    type=str,
-    default=None,
-    help="Model name. Default avocado_metacode_rc (prod and dev).",
-)
-@click.option(
-    "--dev",
-    "--experimental",
-    "dev",
-    is_flag=True,
-    default=False,
-    hidden=True,
-    help="Deprecated: use --llm-provider avocado_free.",
+    help="Custom operator spec YAML (backward compat, now ignored for evolve — uses built-in).",
 )
 def generate_cmd(
     operator: str,
     target_name: str,
-    spec_path: pathlib.Path | None,
-    output_dir: pathlib.Path,
+    config_path: pathlib.Path | None,
+    optimize_flag: str | None,
+    output_dir: pathlib.Path | None,
     llm_provider: str,
-    template: pathlib.Path | None,
     model: str | None,
-    dev: bool,
-) -> None:
-    """Alias for optimize (kept for backward compat with brief doc)."""
-    click.echo("Note: `generate` is alias for `optimize`, prefer `optimize`")
-    ctx = click.get_current_context()
-    ctx.invoke(
-        optimize_cmd,
-        operator=operator,
-        target_name=target_name,
-        spec_path=spec_path,
-        output_dir=output_dir,
-        llm_provider=llm_provider,
-        template=template,
-        model=model,
-        dev=dev,
+    verbose: bool,
+    gen0_size: int | None,
+    gen_n_size: int | None,
+    max_generations: int | None,
+    parallel_calls: int | None,
+    qemu_workers: int | None,
+    spec_path: pathlib.Path | None,
+):
+    """Alias for optimize (evolutionary) — kept for backward compat, generate = optimize."""
+    click.echo("Note: `generate` is alias for `optimize` (evolutionary by default, simple CLI)")
+    _do_evolve(
+        operator,
+        target_name,
+        config_path,
+        optimize_flag,
+        output_dir,
+        llm_provider,
+        model,
+        verbose,
+        gen0_size,
+        gen_n_size,
+        max_generations,
+        parallel_calls,
+        qemu_workers,
+    )
+
+
+@main.command(name="evolve-worker", hidden=True)
+@click.option(
+    "--dna-yaml",
+    "dna_yaml_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    required=True,
+    help="Path to DNA yaml inside container (mounted)",
+)
+@click.option("--operator", "operator_name", type=str, required=True)
+@click.option("--target", "target_name", type=str, default="cortex-m7")
+@click.option(
+    "--reference-c",
+    "reference_c_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    required=True,
+)
+@click.option(
+    "--run-dir", "run_dir", type=click.Path(exists=True, path_type=pathlib.Path), required=True
+)
+@click.option(
+    "--naive-baseline-json",
+    "naive_baseline_json_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+)
+def evolve_worker_cmd(
+    dna_yaml_path: pathlib.Path,
+    operator_name: str,
+    target_name: str,
+    reference_c_path: pathlib.Path,
+    run_dir: pathlib.Path,
+    naive_baseline_json_path: pathlib.Path | None,
+):
+    """Hidden worker for parallel Docker QEMU evaluation — runs inside docker container.
+
+    Behind the scenes of `kernelsmith evolve` simple CLI. Evaluates single DNA via QEMU and updates yaml.
+
+    This is not exposed to users — invoked via docker_runner.py evaluate_single_in_docker.
+    """
+    import json
+
+    try:
+        from kernelsmith.evolution.dna import KernelDNA
+        from kernelsmith.evolution.evaluator import evaluate_single
+
+        dna = KernelDNA.load_yaml(dna_yaml_path)
+
+        naive_baseline = None
+        if naive_baseline_json_path and naive_baseline_json_path.exists():
+            try:
+                naive_baseline = json.loads(naive_baseline_json_path.read_text())
+            except Exception:
+                naive_baseline = None
+
+        # Inside docker, toolchain + QEMU available, so use_qemu=True for real metrics (Decision #4 memory_bytes from QEMU)
+        evaluate_single(
+            dna,
+            operator=operator_name,
+            reference_c=reference_c_path,
+            run_dir=run_dir,
+            target=target_name,
+            mode="fast",
+            use_qemu=True,
+            naive_baseline=naive_baseline,
+        )
+
+        # Save updated DNA yaml back to same path (host mount will see it)
+        dna.save_yaml(dna_yaml_path)
+
+        click.echo(
+            f"Worker evaluated {dna.id}: correct={dna.fitness.constraints.get('correct')} cycles={dna.fitness.objectives.get('cycles')} memory_bytes={dna.fitness.objectives.get('memory_bytes')}"
+        )
+
+    except Exception as e:
+        import traceback
+
+        click.echo(f"Worker failed for {dna_yaml_path}: {e}", err=True)
+        traceback.print_exc()
+        raise click.Abort() from e
+
+
+def _do_evolve(
+    operator: str,
+    target_name: str,
+    config_path: pathlib.Path | None,
+    optimize_flag: str | None,
+    output_dir: pathlib.Path | None,
+    llm_provider: str,
+    model: str | None,
+    verbose: bool,
+    gen0_size: int | None,
+    gen_n_size: int | None = None,
+    max_generations: int | None = None,
+    parallel_calls: int | None = None,
+    qemu_workers: int | None = None,
+):
+    """Shared implementation for evolutionary search — behind simple CLI, parallel Docker + queue.
+
+    User wants: `kernelsmith optimize` to be evolutionary by default (simple CLI), previous one-shot as `oneshot`.
+    And local machine only 4 parallel runs at a time (now configurable to 8), scheduling system queues rest.
+    """
+    import time
+
+    operator = operator.lower()
+    target_name = target_name.lower()
+
+    click.secho(
+        f"=== KernelSmith Optimize (Evolutionary) — {operator} on {target_name} ===",
+        fg="cyan",
+        bold=True,
+    )
+    pc = parallel_calls or 4
+    qw = qemu_workers or 4
+    click.echo(
+        f"Simple CLI, behind scenes: parallel Docker QEMU (max {qw}, queue rest) + LLM parallel {pc}"
+    )
+
+    try:
+        from kernelsmith.config import BUILTIN_BASE_PATH, load_config
+
+        cfg = load_config(
+            base_path=BUILTIN_BASE_PATH, delta_path=config_path, optimize=optimize_flag
+        )
+
+        if gen0_size is not None:
+            cfg.setdefault("population", {})["gen0_size"] = gen0_size
+        if gen_n_size is not None:
+            cfg.setdefault("population", {})["gen_n_size"] = gen_n_size
+        if max_generations is not None:
+            cfg.setdefault("population", {})["max_generations"] = max_generations
+            cfg.setdefault("termination", {})["max_generations"] = max_generations
+        if parallel_calls is not None:
+            cfg.setdefault("llm", {})["parallel_calls"] = parallel_calls
+            # Also update global docker max parallel for QEMU if qemu_workers not set
+            if qemu_workers is None:
+                cfg.setdefault("evaluation", {})["qemu_workers"] = parallel_calls
+        if qemu_workers is not None:
+            cfg.setdefault("evaluation", {})["qemu_workers"] = qemu_workers
+        if model is not None:
+            cfg.setdefault("llm", {})["model"] = model
+
+        # Update scheduler global max to match requested workers (for 8 parallel flag)
+        if qemu_workers is not None or parallel_calls is not None:
+            try:
+                from kernelsmith.evolution.scheduler import set_docker_max_parallel
+
+                set_docker_max_parallel(qemu_workers or parallel_calls or 4)
+            except Exception:
+                pass
+
+        click.echo(
+            f"Config: base.yaml + {config_path if config_path else 'defaults'} + optimize={optimize_flag or 'all (Pareto)'}"
+        )
+        click.echo(
+            f"  population: gen0_size={cfg['population']['gen0_size']}, gen_n_size={cfg['population']['gen_n_size']}, max_generations={cfg['population']['max_generations']}, diversity_min={cfg['population']['diversity_min']}"
+        )
+        click.echo(
+            f"  selection: method={cfg['selection']['method']}, top_k={cfg['selection']['top_k']}, weights={cfg['selection']['weights']}, focus={cfg['selection']['focus_objective']}"
+        )
+        click.echo(
+            f"  llm: model={cfg['llm']['model']}, parallel_calls={cfg['llm']['parallel_calls']}, temps gen0={cfg['llm']['temperature_gen0']}, cross={cfg['llm']['temperature_crossover']}, mut={cfg['llm']['temperature_mutation']}"
+        )
+        click.echo(
+            f"  mutation: enabled={cfg['mutation']['enabled']}, rate={cfg['mutation']['rate']}, types={cfg['mutation']['types']}, weights={cfg['mutation']['type_weights']}"
+        )
+        click.echo(
+            f"  retrieval: enabled={cfg['retrieval']['enabled']}, sources={cfg['retrieval']['sources']}, allow_empty={cfg['retrieval']['allow_empty']} (Decision #7 provisioning)"
+        )
+        click.echo(
+            f"  evaluation: benchmark_runs={cfg['evaluation']['benchmark_runs']}, timeout={cfg['evaluation']['timeout_seconds']}s, QEMU memory_bytes from output (Decision #4)"
+        )
+        click.echo(
+            f"  termination: max_evaluations={cfg['termination']['max_evaluations']}, convergence_window={cfg['termination']['convergence_window']}, threshold={cfg['termination']['convergence_threshold']}"
+        )
+        click.echo(
+            f"  strategy_enums: primary={cfg['strategy_enums']['primary_strategies'][:4]}... (Decision #2 enum for mining)"
+        )
+        click.echo(
+            "  scheduler: LocalScheduler max 4 parallel (user req: only 4 runs parallel at a time, queue rest) + DockerAwareScheduler file semaphore /tmp/kernelsmith_scheduler/"
+        )
+    except Exception as e:
+        click.echo(f"Error loading config: {e}", err=True)
+        raise click.Abort() from e
+
+    if llm_provider in ("avocado", "avocado_free"):
+        import os
+
+        if not os.getenv("KERNELSMITH_MODEL_API_KEY") and not os.getenv("LLAMA_API_KEY"):
+            click.echo(
+                f"Error: KERNELSMITH_MODEL_API_KEY (or LLAMA_API_KEY) not set for provider {llm_provider}. Use --llm-provider mock for CI or export KERNELSMITH_MODEL_API_KEY.",
+                err=True,
+            )
+            raise click.Abort()
+        else:
+            key_src = (
+                "KERNELSMITH_MODEL_API_KEY"
+                if os.getenv("KERNELSMITH_MODEL_API_KEY")
+                else "LLAMA_API_KEY"
+            )
+            click.secho(
+                f"Using LLM provider {llm_provider} with key from {key_src}, model={cfg['llm']['model']}",
+                fg="green",
+            )
+
+    else:
+        click.secho(f"Using LLM provider {llm_provider} (mock, no API key needed)", fg="green")
+
+    # Orchestrator run — simple CLI hides parallel Docker + queue (user req)
+    try:
+        from kernelsmith.evolution.orchestrator import evolve_pipeline
+
+        start = time.time()
+        click.secho(
+            f"\n[1/5] Gen0 Diverse Init (size={cfg['population']['gen0_size']}, enum hints, parallel={cfg['llm']['parallel_calls']} via LocalScheduler queue max 4)...",
+            fg="yellow",
+        )
+
+        result = evolve_pipeline(
+            operator=operator,
+            target=target_name,
+            config=cfg,
+            config_path=config_path,
+            optimize=optimize_flag,
+            output_dir=output_dir,
+            llm_provider_name=llm_provider,
+            model=model or cfg["llm"]["model"],
+            verbose=verbose,
+        )
+
+        elapsed = time.time() - start
+
+        gen_count = len(result.get("generations", []))
+        total_candidates = len(result.get("all_candidates", []))
+        pareto = result.get("pareto_front", [])
+        family_tree = result.get("family_tree", {})
+        hypervolume_history = result.get("hypervolume_history", [])
+
+        click.secho(f"  → Gen0 {cfg['population']['gen0_size']} candidates generated", fg="green")
+        click.secho(
+            "\n[2/5] Evaluate (QEMU) — cycles, memory_bytes (Decision #4 from QEMU output), code_size... (max 4 parallel Docker, queue rest)",
+            fg="yellow",
+        )
+        click.secho(
+            f"  → Evaluated {total_candidates} total, {gen_count} generations, QEMU parallel workers 4 max (local scheduler queue rest, docker parallelism behind simple CLI)",
+            fg="green",
+        )
+
+        click.secho(
+            f"\n[3/5] Select — {cfg['selection']['method']} (Pareto if all/None else user_focus weight 1.0/0.0 per Decision #6)",
+            fg="yellow",
+        )
+        click.secho(
+            f"  → Pareto front size {len(pareto)}, diversity {family_tree.get('stats', {}).get('diversity', 'unknown')}",
+            fg="green",
+        )
+
+        click.secho(
+            f"\n[4/5] Crossover ({cfg['crossover']['num_children']} children, tournament {cfg['crossover']['tournament_size']}) + Mutation ({cfg['mutation']['num_mutants']} mutants, types {cfg['mutation']['types']}) — parallel 4 via scheduler",
+            fg="yellow",
+        )
+        click.secho(
+            f"  → Semantic mixing, parallel LLM calls {cfg['llm']['parallel_calls']} (Decision #8) with queue",
+            fg="green",
+        )
+
+        click.secho(
+            "\n[5/5] Convergence & Best Population Across Generations (hypervolume)", fg="yellow"
+        )
+        click.secho(f"  → Hypervolume history: {hypervolume_history}", fg="green")
+        click.secho(
+            f"  → Best hypervolume {result.get('best_hypervolume', 0):.4f} at gen {result.get('best_generation', 0)} — best among all {gen_count} gens",
+            fg="green",
+        )
+
+        click.secho("\n========================================", fg="cyan")
+        click.secho(
+            f"  Kernelsmith Optimize (Evolve) Report ✓ COMPLETE ({elapsed:.1f}s)",
+            fg="cyan",
+            bold=True,
+        )
+        click.secho("========================================\n", fg="cyan")
+        click.echo(f"Operator:        {operator} (relu default, more ops later)")
+        click.echo(f"Target:          {target_name}")
+        click.echo(
+            f"Optimize:        {optimize_flag or 'all (Pareto, weights 0.6/0.25/0.15)'} → method={cfg['selection']['method']}, focus={cfg['selection']['focus_objective']}"
+        )
+        click.echo(
+            f"LLM Provider:    {llm_provider} (model={cfg['llm']['model']}), parallel {cfg['llm']['parallel_calls']}"
+        )
+        click.echo(
+            f"Generations:     {gen_count} / max {cfg['population']['max_generations']} (K), total evals {result.get('total_evaluations')} / {cfg['termination']['max_evaluations']}"
+        )
+        click.echo(
+            f"Hypervolume:     history {hypervolume_history} → best {result.get('best_hypervolume', 0):.4f} at gen {result.get('best_generation')}"
+        )
+        click.echo("")
+        click.echo("Pareto Front:")
+        for dna in pareto[:5]:
+            c = dna.fitness.objectives.get("cycles", 0)
+            m = dna.fitness.objectives.get("memory_bytes", 0)
+            cs = dna.fitness.objectives.get("code_size_bytes", 0)
+            strat = dna.genotype.primary_strategy.value
+            speedup = dna.fitness.derived.get("speedup_vs_naive", 0)
+            click.echo(
+                f"  - {dna.id}: cycles={c:.0f} memory_bytes={m:.0f} (QEMU) code_size={cs:.0f} strategy={strat} rank={dna.fitness.pareto_rank} crowding={dna.fitness.crowding_distance:.2f} speedup_vs_naive={speedup:.2f}x"
+            )
+        if len(pareto) > 5:
+            click.echo(f"  ... and {len(pareto) - 5} more")
+
+        # Naive baseline comparison — previous optimize used to show comparison, now added per user feedback
+        naive = result.get("naive_baseline", {})
+        if naive:
+            click.echo("")
+            click.echo(
+                "Naive Baseline Comparison (per your note: final answer with comparison vs naive):"
+            )
+            click.echo(
+                f"  Naive (from {naive.get('path', 'reference/naive/relu.c')}): cycles={naive.get('cycles', 0):.0f} memory_bytes={naive.get('memory_bytes', 0):.0f} code_size_bytes={naive.get('code_size_bytes', 0):.0f} (repo for now, future ONNX/C upload)"
+            )
+            if naive.get("note"):
+                click.echo(f"  Note: {naive.get('note')}")
+            click.echo("")
+            click.echo("  Pareto vs Naive:")
+            # Sort Pareto by cycles ascending for best comparison
+            pareto_sorted = sorted(
+                pareto, key=lambda d: d.fitness.objectives.get("cycles", float("inf"))
+            )
+            for dna in pareto_sorted[:5]:
+                c = dna.fitness.objectives.get("cycles", 0)
+                m = dna.fitness.objectives.get("memory_bytes", 0)
+                cs = dna.fitness.objectives.get("code_size_bytes", 0)
+                speedup = dna.fitness.derived.get("speedup_vs_naive", 0)
+                naive_cycles = naive.get("cycles", 1)
+                naive_mem = naive.get("memory_bytes", 1)
+                naive_code = naive.get("code_size_bytes", 1)
+                mem_reduction = (1 - m / naive_mem) * 100 if naive_mem else 0
+                code_reduction = (1 - cs / naive_code) * 100 if naive_code else 0
+                # Check if dummy metrics — warn if still 5000/1200 (no Docker image)
+                is_dummy = c == 5000 and m == 1200 and cs == 400
+                dummy_warn = (
+                    " [DUMMY - Docker image not built, real QEMU requires: docker build -t kernelsmith .]"
+                    if is_dummy
+                    else ""
+                )
+                click.echo(
+                    f"    {dna.id}: {c:.0f} cycles ({speedup:.2f}x vs naive {naive_cycles:.0f}), "
+                    f"{m:.0f} mem ({mem_reduction:+.1f}% vs {naive_mem:.0f}), "
+                    f"{cs:.0f} code ({code_reduction:+.1f}% vs {naive_code:.0f}) strat={dna.genotype.primary_strategy.value}{dummy_warn}"
+                )
+            # Best per objective
+            if pareto:
+                best_cycles = min(
+                    pareto, key=lambda d: d.fitness.objectives.get("cycles", float("inf"))
+                )
+                best_mem = min(
+                    pareto, key=lambda d: d.fitness.objectives.get("memory_bytes", float("inf"))
+                )
+                best_code = min(
+                    pareto, key=lambda d: d.fitness.objectives.get("code_size_bytes", float("inf"))
+                )
+                click.echo("")
+                click.echo(
+                    f"  Best cycles: {best_cycles.id} {best_cycles.fitness.objectives.get('cycles', 0):.0f} ({best_cycles.fitness.derived.get('speedup_vs_naive', 0):.2f}x) strat={best_cycles.genotype.primary_strategy.value}"
+                )
+                click.echo(
+                    f"  Best memory_bytes (from QEMU output, Decision #4): {best_mem.id} {best_mem.fitness.objectives.get('memory_bytes', 0):.0f} strat={best_mem.genotype.primary_strategy.value}"
+                )
+                click.echo(
+                    f"  Best code_size: {best_code.id} {best_code.fitness.objectives.get('code_size_bytes', 0):.0f} strat={best_code.genotype.primary_strategy.value}"
+                )
+
+        click.echo("")
+        click.echo("Family Tree (adjacency list, 4-parallel queue scheduler):")
+        click.echo(
+            f"  Nodes: {family_tree.get('stats', {}).get('total_candidates', total_candidates)}, Pareto: {len(family_tree.get('pareto_front', []))}, Diversity: {family_tree.get('stats', {}).get('diversity')}"
+        )
+        click.echo(f"  File: {result.get('run_dir')}/family_tree.json")
+        click.echo("")
+        click.echo(
+            "Artifacts (filename+hash linking per generation, simple CLI hides parallelism):"
+        )
+        click.echo(f"  Run dir: {result.get('run_dir')}")
+        click.echo(f"  Generations: {result.get('run_dir')}/generation_*/ (.c/.h/.md/.yaml + hash)")
+        click.echo(f"  Pareto: {result.get('run_dir')}/pareto_front.yaml")
+        click.echo(f"  Family tree: {result.get('run_dir')}/family_tree.json")
+        click.echo(
+            f"  Naive baseline: {result.get('run_dir')}/artifacts/naive_baseline.json (repo for now, future ONNX/C upload)"
+        )
+        click.echo("")
+        click.secho(f"Results written to: {result.get('run_dir')}", fg="green", bold=True)
+        click.secho(
+            "Status: COMPLETE ✓ — Simple CLI, parallel Docker + queue behind scenes", fg="green"
+        )
+        click.secho("========================================\n", fg="cyan")
+
+        import json
+
+        results_json = pathlib.Path(result.get("run_dir")) / "results.json"
+        serializable = {
+            "run_id": result.get("run_id"),
+            "operator": operator,
+            "target": target_name,
+            "optimize": optimize_flag or "all",
+            "generations": gen_count,
+            "total_candidates": total_candidates,
+            "pareto_front": [
+                {
+                    "id": d.id,
+                    "objectives": d.fitness.objectives,
+                    "primary_strategy": d.genotype.primary_strategy.value,
+                }
+                for d in pareto
+            ],
+            "hypervolume_history": hypervolume_history,
+            "best_hypervolume": result.get("best_hypervolume"),
+            "best_generation": result.get("best_generation"),
+            "family_tree_path": f"{result.get('run_dir')}/family_tree.json",
+            "run_dir": result.get("run_dir"),
+            "elapsed_s": elapsed,
+        }
+        results_json.write_text(json.dumps(serializable, indent=2))
+        click.echo(f"JSON results: {results_json}")
+
+    except Exception as e:
+        import traceback
+
+        click.echo("\n✗ Evolve pipeline FAILED", err=True)
+        click.echo(f"Error: {e}", err=True)
+        if verbose:
+            traceback.print_exc()
+        raise click.Abort() from e
+
+
+@main.command(name="optimize")
+@click.argument("operator", type=str, required=False, default="relu")
+@click.option(
+    "--target",
+    "-t",
+    "target_name",
+    type=str,
+    default="cortex-m7",
+    show_default=True,
+    help="Target device (e.g., cortex-m7).",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="Delta.yaml for overriding base.yaml defaults (deep merge).",
+)
+@click.option(
+    "--optimize",
+    "optimize_flag",
+    type=str,
+    default=None,
+    help="Optimize focus: cycles, memory, code_size, all, or omit for Pareto (weight 1.0/0.0 vs Pareto).",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    "output_dir",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output dir (default: output/evolve/<op>_<target>_<run_id>/ with generations).",
+)
+@click.option(
+    "--llm-provider",
+    "llm_provider",
+    type=click.Choice(["mock", "avocado", "avocado_free"]),
+    default="mock",
+    show_default=True,
+    help="LLM provider: mock for CI, avocado_free for real.",
+)
+@click.option("--model", type=str, default=None, help="Override LLM model from base.yaml.")
+@click.option("--verbose", is_flag=True, default=False, help="Verbose logging per step.")
+@click.option(
+    "--gen0-size",
+    type=int,
+    default=None,
+    help="Override gen0_size from config (e.g., 2 for fast test, 8 default).",
+)
+@click.option(
+    "--gen-n-size",
+    "gen_n_size",
+    type=int,
+    default=None,
+    help="Override gen_n_size (population size for gen >=1) from config (default 6, e.g., --gen-n-size 8).",
+)
+@click.option(
+    "--max-generations", type=int, default=None, help="Override max_generations (K) from config."
+)
+@click.option(
+    "--parallel-calls",
+    "parallel_calls",
+    type=int,
+    default=None,
+    help="Override LLM parallel calls from config (default 4, set 8 for 8 parallel LLM workers, queue rest via LocalScheduler).",
+)
+@click.option(
+    "--qemu-workers",
+    "qemu_workers",
+    type=int,
+    default=None,
+    help="Override QEMU/Docker parallel workers (default 4, set 8 for 8 parallel docker+QEMU runs, queue rest via DockerAwareScheduler file locks /tmp/kernelsmith_scheduler/). Flag for your request: have 8 parallel worker running for docker and QEMU run.",
+)
+@click.option(
+    "--spec",
+    "spec_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="Custom operator spec YAML (backward compat with old optimize, now ignored for evolve — uses built-in).",
+)
+def optimize_cmd(
+    operator: str,
+    target_name: str,
+    config_path: pathlib.Path | None,
+    optimize_flag: str | None,
+    output_dir: pathlib.Path | None,
+    llm_provider: str,
+    model: str | None,
+    verbose: bool,
+    gen0_size: int | None,
+    gen_n_size: int | None,
+    max_generations: int | None,
+    parallel_calls: int | None,
+    qemu_workers: int | None,
+    spec_path: pathlib.Path | None,
+):
+    """Generate optimized C kernels via evolutionary search (default, simple CLI).
+
+    This is now the DEFAULT — LLM-guided EA: Gen0 diverse init → Evaluate QEMU → Select Pareto → Crossover+Mutation → Pareto Front.
+    Behind scenes: parallel Docker QEMU evaluation (max 4 default, 8 via --qemu-workers flag, queue rest) + LLM parallel 4 default, 8 via --parallel-calls.
+
+    Previous one-shot single-candidate flow is now `kernelsmith oneshot`.
+
+    Examples:
+        kernelsmith optimize relu --target cortex-m7
+        kernelsmith optimize relu --target cortex-m7 --optimize memory
+        kernelsmith optimize relu --target cortex-m7 --config delta.yaml
+        kernelsmith optimize relu --target cortex-m7 --llm-provider mock --gen0-size 2 --max-generations 1
+        kernelsmith optimize relu --target cortex-m7 --llm-provider mock --gen0-size 8 --gen-n-size 6 --max-generations 5 --parallel-calls 8 --qemu-workers 8
+    """
+    _do_evolve(
+        operator,
+        target_name,
+        config_path,
+        optimize_flag,
+        output_dir,
+        llm_provider,
+        model,
+        verbose,
+        gen0_size,
+        gen_n_size,
+        max_generations,
+        parallel_calls,
+        qemu_workers,
+    )
+
+
+@main.command(name="evolve", hidden=True)
+@click.argument("operator", type=str, required=False, default="relu")
+@click.option(
+    "--target",
+    "-t",
+    "target_name",
+    type=str,
+    default="cortex-m7",
+    show_default=True,
+    help="Target device (e.g., cortex-m7).",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="Delta.yaml for overriding base.yaml defaults (deep merge).",
+)
+@click.option(
+    "--optimize",
+    "optimize_flag",
+    type=str,
+    default=None,
+    help="Optimize focus: cycles, memory, code_size, all, or omit for Pareto (weight 1.0/0.0 scalarization vs Pareto per decision #6).",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    "output_dir",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output dir (default: output/evolve/<op>_<target>_<run_id>/ with generations).",
+)
+@click.option(
+    "--llm-provider",
+    "llm_provider",
+    type=click.Choice(["mock", "avocado", "avocado_free"]),
+    default="mock",
+    show_default=True,
+    help="LLM provider: mock for CI, avocado_free for real (requires KERNELSMITH_MODEL_API_KEY).",
+)
+@click.option("--model", type=str, default=None, help="Override LLM model from base.yaml.")
+@click.option("--verbose", is_flag=True, default=False, help="Verbose logging per step.")
+@click.option(
+    "--gen0-size",
+    type=int,
+    default=None,
+    help="Override gen0_size from config (e.g., 2 for fast test).",
+)
+@click.option(
+    "--gen-n-size",
+    "gen_n_size",
+    type=int,
+    default=None,
+    help="Override gen_n_size (population size gen>=1) from config.",
+)
+@click.option(
+    "--max-generations", type=int, default=None, help="Override max_generations (K) from config."
+)
+@click.option(
+    "--parallel-calls",
+    "parallel_calls",
+    type=int,
+    default=None,
+    help="Override LLM parallel calls (e.g., 8 for 8 parallel LLM workers).",
+)
+@click.option(
+    "--qemu-workers",
+    "qemu_workers",
+    type=int,
+    default=None,
+    help="Override QEMU/Docker parallel workers (e.g., 8 for 8 parallel docker+QEMU).",
+)
+def evolve_cmd(
+    operator: str,
+    target_name: str,
+    config_path: pathlib.Path | None,
+    optimize_flag: str | None,
+    output_dir: pathlib.Path | None,
+    llm_provider: str,
+    model: str | None,
+    verbose: bool,
+    gen0_size: int | None,
+    gen_n_size: int | None,
+    max_generations: int | None,
+    parallel_calls: int | None,
+    qemu_workers: int | None,
+):
+    """Hidden alias for optimize (evolutionary) — kept for backward compat with tests using evolve.
+
+    New default is `kernelsmith optimize` which is evolutionary. Use `oneshot` for old single-candidate flow.
+    """
+    _do_evolve(
+        operator,
+        target_name,
+        config_path,
+        optimize_flag,
+        output_dir,
+        llm_provider,
+        model,
+        verbose,
+        gen0_size,
+        gen_n_size,
+        max_generations,
+        parallel_calls,
+        qemu_workers,
     )
 
 
@@ -248,7 +1703,7 @@ def generate_cmd(
     type=click.Choice(["fast", "full", "auto"]),
     default="auto",
     show_default=True,
-    help="QEMU mode: fast=instruction accurate qemu-user, full=cycle approximate qemu-system, auto=fast.",
+    help="QEMU mode: fast=instruction accurate, full=cycle approx, auto=fast.",
 )
 @click.option(
     "--output",
@@ -264,6 +1719,20 @@ def generate_cmd(
     default=False,
     help="Legacy flag, implies --mode full.",
 )
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Verbose logging (compiler commands, full output).",
+)
+@click.option(
+    "--docker/--no-docker",
+    "use_docker",
+    is_flag=True,
+    default=None,
+    help="Auto Docker fallback for smooth UX. Default auto.",
+)
+@click.option("--docker-image", type=str, default=None, help="Docker image for auto fallback.")
 def benchmark_cmd(
     kernel: pathlib.Path,
     target: pathlib.Path | None,
@@ -272,12 +1741,58 @@ def benchmark_cmd(
     mode: str,
     output: pathlib.Path,
     qemu: bool,
+    verbose: bool,
+    use_docker: bool | None,
+    docker_image: str | None,
 ) -> None:
     """Benchmark a kernel using arm-none-eabi-gcc and QEMU with metrics."""
+
+    # Auto-Docker smooth UX for benchmark (needs toolchain)
+    should_docker = False
+    if use_docker is None:
+        try:
+            from kernelsmith.toolchain import resolve_toolchain as _rt
+            from kernelsmith.toolchain import toolchain_available as _ta
+
+            _tc = _rt(target_name, target)
+            if not _ta(_tc.compiler):
+                should_docker = True
+        except Exception:
+            should_docker = True
+    elif use_docker is True:
+        should_docker = True
+
+    if should_docker and not os.getenv("KERNELSMITH_INSIDE_DOCKER") and _is_docker_available():
+        img = docker_image or _find_docker_image()
+        if img:
+            inner = [
+                "benchmark",
+                "--kernel",
+                f"/workspace/{kernel}" if str(kernel).startswith("/") else f"/workspace/{kernel}",
+                "--target-name",
+                target_name,
+                "--mode",
+                mode,
+                "--output",
+                f"/workspace/{output}",
+            ]
+            if verbose:
+                inner.append("--verbose")
+            inner.append("--no-docker")
+            host_pwd = pathlib.Path.cwd()
+            docker_cmd = _build_docker_run_cmd(img, host_pwd, inner)
+            click.secho(
+                f"Toolchain missing locally → auto-running benchmark inside Docker {img}...",
+                fg="cyan",
+                bold=True,
+            )
+            result = subprocess.run(docker_cmd)
+            sys.exit(result.returncode)
     if qemu:
         mode = "full"
     try:
-        # Resolve hardware profile for toolchain config
+        _log_step_start(1, 3, f"Resolving toolchain for {target_name}")
+        start = time.time()
         hp_path = target
         if hp_path is None:
             try:
@@ -286,26 +1801,39 @@ def benchmark_cmd(
                 hp_path = None
         tc = resolve_toolchain(target_name, hp_path)
         if not toolchain_available(tc.compiler):
-            click.echo(
-                f"Error: toolchain {tc.compiler} not found. Use kernelsmith Docker image.", err=True
+            _log_failure_block(
+                "Toolchain Resolution",
+                context=f"target={target_name} compiler={tc.compiler}",
+                error=f"Toolchain {tc.compiler} not found",
+                suggestions=(
+                    "Use Docker: docker run --rm -v $PWD:/workspace -w /workspace kernelsmith benchmark ..."
+                ),
             )
             raise click.Abort()
+        _log_step_success(1, "Toolchain Resolution", time.time() - start, f"compiler={tc.compiler}")
+
+        _log_step_start(2, 3, f"Compiling {kernel} for {target_name}")
+        start = time.time()
         build_dir = pathlib.Path("./build")
         build_dir.mkdir(exist_ok=True)
         elf_path = build_dir / f"{kernel.stem}.elf"
-        click.echo(
-            f"Compiling {kernel} for {target_name} with {tc.compiler} {tc.arch_flag} {tc.fpu_flag} {tc.float_abi_flag}..."
-        )
+        flags = f"{tc.arch_flag} {tc.fpu_flag} {tc.float_abi_flag}"
+        if verbose:
+            _log_step_detail(f"Compiler: {tc.compiler} {flags}")
         compile_info = compile_c_to_elf(kernel, elf_path, tc, mode="speed")
-        click.echo(f"ELF size info:\n{compile_info['size']}")
+        _log_step_success(
+            2,
+            "Compilation",
+            time.time() - start,
+            f"ELF {elf_path} size={compile_info['size'][:100]}",
+        )
 
-        # For full mode, build real baremetal system image with startup/linker/semihosting + DWT
+        # For full mode, build real baremetal system image
         if mode == "full":
             system_elf = build_dir / f"{kernel.stem}_system.elf"
             try:
                 import re
 
-                # Try to auto-detect func name from kernel source
                 func_name = None
                 try:
                     txt = kernel.read_text(errors="ignore")
@@ -314,9 +1842,11 @@ def benchmark_cmd(
                         func_name = m.group(1)
                 except Exception:
                     pass
-                click.echo(
-                    f"Compiling baremetal system image for {tc.qemu_machine} {tc.qemu_cpu} (func={func_name or 'auto'})..."
-                )
+                if verbose:
+                    _log_step_detail(
+                        f"Compiling baremetal system image for {tc.qemu_machine} "
+                        f"{tc.qemu_cpu} func={func_name or 'auto'} iters={iterations}"
+                    )
                 sys_info = compile_baremetal_system_elf(
                     kernel_source=kernel,
                     output_elf=system_elf,
@@ -325,23 +1855,21 @@ def benchmark_cmd(
                     func_name=func_name,
                     iters=iterations,
                 )
-                click.echo(f"System ELF size:\n{sys_info['size']}")
                 compile_info = {**compile_info, "system": sys_info}
                 emu_elf = system_elf
                 metrics_elf = system_elf
             except Exception as e:
-                click.echo(
-                    f"WARN: system ELF build failed ({e}), falling back to simple ELF", err=True
-                )
+                if verbose:
+                    _log_step_detail(f"System ELF build failed ({e}), fallback to simple ELF")
                 emu_elf = elf_path
                 metrics_elf = elf_path
+                compile_info["system_compile_error"] = str(e)
         else:
             emu_elf = elf_path
             metrics_elf = elf_path
 
-        click.echo(
-            f"Emulating under QEMU mode={mode} (user={tc.qemu_user}, system={tc.qemu_system} machine={tc.qemu_machine} cpu={tc.qemu_cpu})..."
-        )
+        _log_step_start(3, 3, f"Emulating under QEMU mode={mode}")
+        start = time.time()
         emu = emulate(
             emu_elf,
             mode=mode,
@@ -350,6 +1878,16 @@ def benchmark_cmd(
             machine=tc.qemu_machine,
             cpu=tc.qemu_cpu,
         )
+        _log_step_success(
+            3,
+            "QEMU Emulation",
+            time.time() - start,
+            f"mode={emu.mode} returncode={emu.returncode}",
+        )
+        if verbose:
+            _log_step_detail(f"STDOUT: {emu.stdout[:500]}")
+            _log_step_detail(f"STDERR: {emu.stderr[:500]}")
+
         metrics = collect_metrics(metrics_elf, emu, target_name)
         out_data = {
             "kernel": str(kernel),
@@ -374,7 +1912,12 @@ def benchmark_cmd(
                 "stdout": emu.stdout[:2000],
                 "stderr": emu.stderr[:2000],
             },
-            "tradeoff_note": "fast mode = instruction accurate via qemu-user -d in_asm (cortex-a15 proxy); full mode = real baremetal qemu-system-arm -machine mps2-an500 -cpu cortex-m7 with semihosting + DWT CYCCNT cycle-accurate. Use fast for iteration speed, full for realistic MCU timing.",
+            "tradeoff_note": (
+                "fast=instruction accurate via qemu-user -d in_asm "
+                "(cortex-a15 proxy, no DWT); full=real baremetal "
+                "qemu-system-arm -machine mps2-an500 -cpu cortex-m7 "
+                "semihosting + DWT CYCCNT cycle-accurate"
+            ),
         }
         output.write_text(json.dumps(out_data, indent=2))
         click.echo(f"Benchmark complete. Metrics written to {output}")
@@ -382,11 +1925,13 @@ def benchmark_cmd(
         click.echo(f"  time_us: {metrics.time_us}")
         click.echo(f"  instruction_count: {metrics.instruction_count}")
         click.echo(
-            f"  text_bytes: {metrics.text_bytes}  data: {metrics.data_bytes}  bss: {metrics.bss_bytes}  total: {metrics.total_bytes}"
+            f"  text={metrics.text_bytes} data={metrics.data_bytes} bss={metrics.bss_bytes} total={metrics.total_bytes}"
         )
         click.echo(f"  mode: {metrics.mode}  target: {metrics.target}")
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
+        _log_failure_block(
+            "Benchmark", context=f"kernel={kernel} target={target_name} mode={mode}", error=str(e)
+        )
         raise click.Abort() from e
 
 
@@ -415,57 +1960,311 @@ def benchmark_cmd(
 @click.option(
     "--tolerance",
     type=float,
-    default=1e-5,
+    default=None,
     show_default=True,
-    help="Numerical tolerance for validation.",
+    help="Numerical tolerance for validation. Defaults to precision-based tolerance if not set.",
+)
+@click.option(
+    "--precision",
+    type=click.Choice(["fp32", "fp16", "bf16", "int8", "int16", "q15", "q31"]),
+    default="fp32",
+    show_default=True,
+    help="Precision for tolerance selection.",
+)
+@click.option(
+    "--target",
+    "-t",
+    type=str,
+    default="cortex-m7",
+    show_default=True,
+    help="Hardware target for vector generation.",
 )
 @click.option(
     "--target-name",
     type=str,
-    default="cortex-m7",
-    show_default=True,
-    help="Target for toolchain.",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for --target.",
 )
+@click.option(
+    "--qemu",
+    is_flag=True,
+    default=False,
+    help="Run validation inside QEMU (requires cross-toolchain and qemu-arm, use Docker image).",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["fast", "full", "auto"]),
+    default="fast",
+    show_default=True,
+    help="QEMU mode when --qemu is set.",
+)
+@click.option(
+    "--use-linux",
+    is_flag=True,
+    default=True,
+    help="Use arm-linux-gnueabihf-gcc for QEMU validation (default, simpler).",
+)
+@click.option(
+    "--output",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output JSON file with validation results + metrics (for QEMU mode).",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Verbose logging (full compiler output, driver output).",
+)
+@click.option(
+    "--docker/--no-docker",
+    "use_docker",
+    is_flag=True,
+    default=None,
+    help="Auto Docker fallback. Default auto when --qemu and toolchain missing.",
+)
+@click.option("--docker-image", type=str, default=None, help="Docker image for auto fallback.")
 def validate_cmd(
     generated: pathlib.Path,
     reference: pathlib.Path,
     operator: pathlib.Path,
-    tolerance: float,
-    target_name: str,
+    tolerance: float | None,
+    precision: str,
+    target: str,
+    target_name: str | None,
+    qemu: bool,
+    mode: str,
+    use_linux: bool,
+    output: pathlib.Path | None,
+    verbose: bool,
+    use_docker: bool | None,
+    docker_image: str | None,
 ) -> None:
-    """Validate optimized kernel correctness against reference using toolchain compile check."""
-    try:
-        tc = resolve_toolchain(target_name)
-        if not toolchain_available(tc.compiler):
-            click.echo(f"Error: toolchain {tc.compiler} not found. Use Docker image.", err=True)
-            raise click.Abort()
-        build_dir = pathlib.Path("./build")
-        build_dir.mkdir(exist_ok=True)
-        gen_elf = build_dir / f"{generated.stem}_val.elf"
-        ref_elf = build_dir / f"{reference.stem}_val.elf"
-        click.echo(f"Compiling generated {generated}...")
-        compile_c_to_elf(generated, gen_elf, tc)
-        click.echo(f"Compiling reference {reference}...")
-        compile_c_to_elf(reference, ref_elf, tc)
-        # Size comparison as proxy for validation in this scaffolding
-        from kernelsmith.metrics import get_size_metrics
+    """Validate optimized kernel correctness against reference."""
+    effective_target = target_name or target
 
-        gen_size = get_size_metrics(gen_elf)
-        ref_size = get_size_metrics(ref_elf)
-        click.echo("Validation (compile + size check) passed.")
-        click.echo(
-            f"  Generated: text={gen_size.text} data={gen_size.data} bss={gen_size.bss} total={gen_size.total}"
+    # Auto-Docker for QEMU validation if toolchain missing
+    if qemu:
+        should_docker = False
+        if use_docker is None:
+            try:
+                from kernelsmith.toolchain import (
+                    linux_toolchain_available as _lta,
+                )
+                from kernelsmith.toolchain import (
+                    resolve_toolchain as _rt,
+                )
+                from kernelsmith.toolchain import (
+                    toolchain_available as _ta,
+                )
+
+                _tc = _rt(effective_target)
+                if not _ta(_tc.compiler) and not _lta():
+                    should_docker = True
+            except Exception:
+                should_docker = True
+        elif use_docker is True:
+            should_docker = True
+
+        if should_docker and not os.getenv("KERNELSMITH_INSIDE_DOCKER") and _is_docker_available():
+            img = docker_image or _find_docker_image()
+            if img:
+                # Build inner validate command
+                inner = [
+                    "validate",
+                    "--generated",
+                    f"/workspace/{generated}"
+                    if not str(generated).startswith("/workspace")
+                    else str(generated),
+                    "--reference",
+                    f"/workspace/{reference}"
+                    if not str(reference).startswith("/workspace")
+                    else str(reference),
+                    "--operator",
+                    f"/workspace/{operator}"
+                    if not str(operator).startswith("/workspace")
+                    else str(operator),
+                    "--target",
+                    effective_target,
+                    "--precision",
+                    precision,
+                    "--qemu",
+                    "--mode",
+                    mode,
+                ]
+                if use_linux:
+                    inner.append("--use-linux")
+                if tolerance is not None:
+                    inner.extend(["--tolerance", str(tolerance)])
+                if output:
+                    inner.extend(["--output", f"/workspace/{output}"])
+                if verbose:
+                    inner.append("--verbose")
+                inner.append("--no-docker")
+                host_pwd = pathlib.Path.cwd()
+                docker_cmd = _build_docker_run_cmd(img, host_pwd, inner)
+                click.secho(
+                    f"Toolchain missing locally → auto-running validate --qemu inside Docker {img}...",
+                    fg="cyan",
+                    bold=True,
+                )
+                result = subprocess.run(docker_cmd)
+                sys.exit(result.returncode)
+
+    if qemu:
+        # QEMU path
+        try:
+            from kernelsmith.toolchain import (
+                linux_toolchain_available,
+                resolve_toolchain,
+                toolchain_available,
+            )
+            from kernelsmith.validation.harness import validate_from_paths_qemu
+
+            _log_step_start(
+                1, 3, f"Resolving toolchain for QEMU validation target={effective_target}"
+            )
+            start = time.time()
+            tc = resolve_toolchain(effective_target)
+            has_baremetal = toolchain_available(tc.compiler)
+            has_linux = linux_toolchain_available()
+            if not has_baremetal and not has_linux:
+                _log_failure_block(
+                    "Toolchain Resolution",
+                    context=f"target={effective_target} compiler={tc.compiler} linux=arm-linux-gnueabihf-gcc",
+                    error="No cross-toolchain found",
+                    suggestions="Use Docker image: docker run --rm -v $PWD:/workspace -w /workspace kernelsmith validate --qemu ...\n"
+                    "Or install: apt-get install gcc-arm-none-eabi gcc-arm-linux-gnueabihf qemu-user",
+                )
+                raise click.Abort()
+            _log_step_success(
+                1,
+                "Toolchain Resolution",
+                time.time() - start,
+                f"baremetal={has_baremetal} linux={has_linux} qemu={tc.qemu_user}",
+            )
+
+            _log_step_start(
+                2, 3, f"Compiling validation suite for QEMU (mode={mode}, use_linux={use_linux})"
+            )
+            start = time.time()
+            result = validate_from_paths_qemu(
+                generated_c=generated,
+                reference_c=reference,
+                operator_yaml=operator,
+                tolerance=tolerance,
+                precision=precision,
+                target=effective_target,
+                mode=mode,
+                use_linux=use_linux,
+                workspace=pathlib.Path("./build"),
+            )
+            _log_step_success(
+                2,
+                "QEMU Compilation & Execution",
+                time.time() - start,
+                f"compile={result.compile_success} correctness={result.correctness_passed}",
+            )
+
+            # Output structured result
+            _log_step_start(3, 3, "Collecting results")
+            click.echo(f"Operator: {result.operator}")
+            click.echo(f"Generated: {result.generated_path}")
+            click.echo(f"Reference: {result.reference_path}")
+            click.echo(f"Compile success: {result.compile_success}")
+            click.echo(f"Correctness passed: {result.correctness_passed}")
+            click.echo(f"Safety passed: {result.safety_passed} (skipped for QEMU)")
+            click.echo(f"Failed step: {result.failed_step or 'none'}")
+            click.echo("Details:")
+            click.echo(result.details[:5000] if not verbose else result.details)
+            click.echo("Performance metrics (QEMU):")
+            for k, v in result.performance_metrics.items():
+                if verbose or k not in ("compile_info", "emulation"):
+                    click.echo(f"  {k}: {str(v)[:500]}")
+
+            if output:
+                output.write_text(json.dumps(result.to_dict(), indent=2))
+                click.echo(f"Results JSON written to {output}")
+
+            if result.passed:
+                click.secho(
+                    f"Validation PASSED for {result.operator} under QEMU mode={mode}",
+                    fg="green",
+                    bold=True,
+                )
+            else:
+                _log_failure_block(
+                    "Validation Correctness (QEMU)",
+                    context=f"operator={result.operator} target={effective_target} mode={mode} use_linux={use_linux}",
+                    error=f"Validation FAILED at {result.failed_step}",
+                    details=result.details,
+                    suggestions="Inspect generated C for out-of-bounds, NaN handling, or incorrect logic.\n"
+                    "Try host validation first: kernelsmith validate --generated ... --reference ... --operator ... (without --qemu)\n"
+                    "Or try different LLM provider: --llm-provider mock vs avocado_free",
+                    artifacts=f"Generated: {result.generated_path}, Build dir: ./build/",
+                )
+                raise click.Abort()
+
+        except click.Abort:
+            raise
+        except Exception as e:
+            _log_failure_block(
+                "QEMU Validation",
+                context=f"generated={generated} reference={reference} operator={operator} target={effective_target} mode={mode}",
+                error=str(e),
+                suggestions="Use --verbose for more details, ensure Docker image has toolchain",
+            )
+            raise click.Abort() from e
+
+    else:
+        # Host path (original)
+        try:
+            from kernelsmith.validation.harness import validate_from_paths
+        except ImportError as e:
+            click.echo(f"Error importing validation harness: {e}", err=True)
+            raise click.Abort() from e
+
+        _log_step_start(1, 2, f"Running host validation for {operator.stem}")
+        start = time.time()
+        result = validate_from_paths(
+            generated_c=generated,
+            reference_c=reference,
+            operator_yaml=operator,
+            tolerance=tolerance,
+            precision=precision,
+            target=effective_target,
         )
-        click.echo(
-            f"  Reference: text={ref_size.text} data={ref_size.data} bss={ref_size.bss} total={ref_size.total}"
-        )
-        click.echo(f"  Tolerance for numerical check (future full numpy compare): {tolerance}")
-        click.echo(
-            "  NOTE: Full numerical validation under QEMU with test vectors is planned; current check ensures both compile and link successfully for target."
-        )
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        raise click.Abort() from e
+        _log_step_success(1, "Host Validation", time.time() - start)
+
+        click.echo(f"Operator: {result.operator}")
+        click.echo(f"Generated: {result.generated_path}")
+        click.echo(f"Reference: {result.reference_path}")
+        click.echo(f"Compile success: {result.compile_success}")
+        click.echo(f"Correctness passed: {result.correctness_passed}")
+        click.echo(f"Safety passed: {result.safety_passed}")
+        click.echo(f"Failed step: {result.failed_step or 'none'}")
+        click.echo("Details:")
+        click.echo(result.details[:5000] if not verbose else result.details)
+        click.echo("Performance metrics:")
+        for k, v in result.performance_metrics.items():
+            click.echo(f"  {k}: {v}")
+
+        if output:
+            output.write_text(json.dumps(result.to_dict(), indent=2))
+            click.echo(f"Results JSON written to {output}")
+
+        if result.passed:
+            click.secho(f"Validation PASSED for {result.operator}", fg="green", bold=True)
+        else:
+            _log_failure_block(
+                "Host Validation",
+                context=f"operator={result.operator} target={effective_target}",
+                error=f"Validation FAILED at {result.failed_step}",
+                details=result.details,
+                suggestions="Check generated C syntax, ensure reference function signature matches, try different tolerance",
+            )
+            raise click.Abort()
 
 
 @main.command(name="list-operators")
@@ -658,21 +2457,159 @@ def report_cmd(
 @click.option(
     "--workspace", type=click.Path(path_type=pathlib.Path), default=pathlib.Path("/workspace")
 )
-def pipeline_cmd(operator, target, spec, output_dir, llm_provider, mode, workspace):
+@click.option(
+    "--validate",
+    is_flag=True,
+    default=False,
+    help="Run validation suite under QEMU after codegen (full E2E).",
+)
+@click.option(
+    "--precision",
+    type=click.Choice(["fp32", "fp16", "bf16", "int8", "int16", "q15", "q31"]),
+    default="fp32",
+    show_default=True,
+    help="Precision for validation when --validate is set.",
+)
+@click.option(
+    "--use-linux",
+    is_flag=True,
+    default=True,
+    help="Use arm-linux-gnueabihf-gcc for QEMU validation (default).",
+)
+@click.option(
+    "--output-json",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output JSON file for results (when --validate).",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Verbose logging.",
+)
+@click.option(
+    "--docker/--no-docker",
+    "use_docker",
+    is_flag=True,
+    default=None,
+    help="Auto Docker fallback for QEMU validation. Default auto when --validate and toolchain missing.",
+)
+@click.option("--docker-image", type=str, default=None, help="Docker image for auto fallback.")
+def pipeline_cmd(
+    operator,
+    target,
+    spec,
+    output_dir,
+    llm_provider,
+    mode,
+    workspace,
+    validate,
+    precision,
+    use_linux,
+    output_json,
+    verbose,
+    use_docker,
+    docker_image,
+):
     """End-to-end LLM harness pipeline: optimize -> compile -> emulate -> metrics."""
+    # Auto-Docker for validation path
+    if validate:
+        should_docker = False
+        if use_docker is None:
+            try:
+                from kernelsmith.toolchain import (
+                    linux_toolchain_available as _lta,
+                )
+                from kernelsmith.toolchain import (
+                    resolve_toolchain as _rt,
+                )
+                from kernelsmith.toolchain import (
+                    toolchain_available as _ta,
+                )
+
+                _tc = _rt(target)
+                if not _ta(_tc.compiler) and not _lta():
+                    should_docker = True
+            except Exception:
+                should_docker = True
+        elif use_docker is True:
+            should_docker = True
+
+        if should_docker and not os.getenv("KERNELSMITH_INSIDE_DOCKER") and _is_docker_available():
+            img = docker_image or _find_docker_image()
+            if img:
+                inner = [
+                    "pipeline",
+                    operator,
+                    "--target",
+                    target,
+                    "--llm-provider",
+                    llm_provider,
+                    "--mode",
+                    mode,
+                    "--validate",
+                    "--precision",
+                    precision,
+                    "--workspace",
+                    "/workspace",
+                ]
+                if use_linux:
+                    inner.append("--use-linux")
+                if output_json:
+                    inner.extend(["--output-json", f"/workspace/{output_json}"])
+                if verbose:
+                    inner.append("--verbose")
+                inner.append("--no-docker")
+                host_pwd = pathlib.Path.cwd()
+                docker_cmd = _build_docker_run_cmd(img, host_pwd, inner)
+                click.secho(
+                    f"Toolchain missing locally → auto-running pipeline --validate inside Docker {img}...",
+                    fg="cyan",
+                    bold=True,
+                )
+                result = subprocess.run(docker_cmd)
+                sys.exit(result.returncode)
+
     try:
-        click.echo(f"Running kernelsmith pipeline for {operator} on {target} mode={mode}...")
-        result = run_kernelsmith_pipeline(
-            operator=operator,
-            target=target,
-            mode=mode,
-            llm_provider=llm_provider,
-            workspace=str(workspace),
-        )
-        click.echo(json.dumps(result, indent=2))
-        click.echo("Pipeline complete. Metrics ready for LLM harness reasoning.")
+        if validate:
+            click.echo(
+                f"Running kernelsmith pipeline WITH validation for {operator} on {target} mode={mode}..."
+            )
+            from kernelsmith.harness import KernelsmithHarness
+
+            h = KernelsmithHarness(target=target, mode=mode, workspace=workspace)
+            result = h.e2e_pipeline(
+                operator=operator,
+                spec_path=spec,
+                llm_provider=llm_provider,
+                precision=precision,
+                use_linux=use_linux,
+                output_json=output_json,
+            )
+            result_dict = result.to_dict()
+            if verbose:
+                click.echo(json.dumps(result_dict, indent=2))
+            _print_e2e_success_report(result_dict, verbose=verbose)
+            click.echo("Pipeline WITH validation complete.")
+        else:
+            click.echo(f"Running kernelsmith pipeline for {operator} on {target} mode={mode}...")
+            result = run_kernelsmith_pipeline(
+                operator=operator,
+                target=target,
+                mode=mode,
+                llm_provider=llm_provider,
+                workspace=str(workspace),
+            )
+            click.echo(json.dumps(result, indent=2))
+            click.echo("Pipeline complete. Metrics ready for LLM harness reasoning.")
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
+        _log_failure_block(
+            "Pipeline",
+            context=f"operator={operator} target={target} mode={mode} provider={llm_provider} validate={validate}",
+            error=str(e),
+            suggestions="Try --llm-provider mock for offline, or check KERNELSMITH_MODEL_API_KEY, or use Docker image for toolchain",
+        )
         raise click.Abort() from e
 
 
@@ -719,6 +2656,484 @@ def compare_modes_cmd(operator, target, spec, llm_provider, workspace):
         click.echo(comp["tradeoff_note"])
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
+        raise click.Abort() from e
+
+
+# ------------------------------------------------------------------
+# New E2E command: codegen + test suite gen + QEMU execution + results
+# ------------------------------------------------------------------
+@main.command(name="e2e")
+@click.argument("operator", type=str)
+@click.option(
+    "--target", "-t", type=str, default="cortex-m7", show_default=True, help="Target device."
+)
+@click.option(
+    "--spec",
+    type=click.Path(exists=True, path_type=pathlib.Path),
+    default=None,
+    help="Custom operator spec YAML.",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    "output_dir",
+    type=click.Path(path_type=pathlib.Path),
+    default=pathlib.Path("./output"),
+    show_default=True,
+    help="Output directory for generated .h/.c/.md triplet.",
+)
+@click.option(
+    "--llm-provider",
+    type=click.Choice(["mock", "avocado", "avocado_free"]),
+    default="avocado_free",
+    show_default=True,
+    help="LLM provider: avocado_free=real (default, final), mock=offline CI.",
+)
+@click.option(
+    "--model",
+    type=str,
+    default=None,
+    help="Model name, default avocado_metacode_rc.",
+)
+@click.option(
+    "--mode", type=click.Choice(["fast", "full", "auto"]), default="fast", show_default=True
+)
+@click.option(
+    "--workspace",
+    type=click.Path(path_type=pathlib.Path),
+    default=pathlib.Path("."),
+    show_default=True,
+    help="Workspace dir containing build/ and results/ subdirs, default current dir for host dev.",
+)
+@click.option(
+    "--precision",
+    type=click.Choice(["fp32", "fp16", "bf16", "int8", "int16", "q15", "q31"]),
+    default="fp32",
+    show_default=True,
+    help="Precision for validation.",
+)
+@click.option(
+    "--use-linux/--use-semihost",
+    "use_linux",
+    is_flag=True,
+    default=True,
+    show_default=True,
+    help="Use arm-linux-gnueabihf-gcc (linux) vs arm-none-eabi with semihosting.",
+)
+@click.option(
+    "--results",
+    "--output-json",
+    "output_json",
+    type=click.Path(path_type=pathlib.Path),
+    default=None,
+    help="Output JSON file for combined E2E results.",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Verbose logging (full compiler commands, driver output).",
+)
+@click.option(
+    "--quiet",
+    is_flag=True,
+    default=False,
+    help="Quiet mode, only final JSON and report.",
+)
+@click.option(
+    "--docker/--no-docker",
+    "use_docker",
+    is_flag=True,
+    default=None,
+    help="Force Docker or disable auto Docker fallback. Default auto: if toolchain missing locally, auto-run inside Docker for smooth UX.",
+)
+@click.option(
+    "--docker-image",
+    type=str,
+    default=None,
+    help="Docker image to use for auto fallback (default auto-detect kernelsmith:test, kernelsmith, env KERNELSMITH_DOCKER_IMAGE).",
+)
+def e2e_cmd(
+    operator,
+    target,
+    spec,
+    output_dir,
+    llm_provider,
+    model,
+    mode,
+    workspace,
+    precision,
+    use_linux,
+    output_json,
+    verbose,
+    quiet,
+    use_docker,
+    docker_image,
+):
+    """
+    End-to-end pipeline: codegen -> test suite generation -> QEMU execution -> results.
+
+    Code gen should generate code, test suit should add tests using the code and then these
+    tests should be run in QEMU and finally results should be outputed.
+
+    Default LLM provider is avocado_free (real) for final validation, but mock can be used for CI fast path:
+
+      \b
+      Mock (CI/fast):  kernelsmith e2e relu --target cortex-m7
+        --llm-provider mock --mode fast
+      Real (Final):  KERNELSMITH_MODEL_API_KEY=... kernelsmith e2e relu
+        --target cortex-m7 --llm-provider avocado_free --mode fast
+      Docker Mock:  docker run --rm -v $PWD:/workspace -w /workspace
+        kernelsmith e2e relu --target cortex-m7 --llm-provider mock --mode fast
+      Docker Real:  docker run --rm -e KERNELSMITH_MODEL_API_KEY
+        -v $PWD:/workspace -w /workspace kernelsmith e2e relu
+        --target cortex-m7 --llm-provider avocado_free --mode fast
+    """
+    try:
+        operator = operator.lower()
+        target = target.lower()
+
+        # ------------------------------------------------------------------
+        # Auto-Docker smooth UX: if toolchain missing locally, run inside Docker
+        # ------------------------------------------------------------------
+        # Determine if we should auto-run in Docker for smooth UX
+        # use_docker=None means auto, True means force, False means never
+        should_auto_docker = False
+        if use_docker is None:
+            # Auto mode: check if toolchain missing
+            try:
+                from kernelsmith.toolchain import (
+                    linux_toolchain_available as _lta,
+                )
+                from kernelsmith.toolchain import (
+                    qemu_available as _qa,
+                )
+                from kernelsmith.toolchain import (
+                    resolve_toolchain as _rt,
+                )
+                from kernelsmith.toolchain import (
+                    toolchain_available as _ta,
+                )
+
+                _tc = _rt(target)
+                _has_bare = _ta(_tc.compiler)
+                _has_linux = _lta()
+                _has_qemu = _qa(_tc.qemu_user)
+                if not _has_bare and not _has_linux or not _has_qemu:
+                    should_auto_docker = True
+            except Exception:
+                should_auto_docker = True  # If resolve fails, try Docker
+        elif use_docker is True:
+            should_auto_docker = True
+
+        if should_auto_docker and not os.getenv("KERNELSMITH_INSIDE_DOCKER"):
+            # Prevent recursion: set env var inside Docker
+            if _is_docker_available():
+                img = docker_image or _find_docker_image()
+                if img:
+                    # Build inner command args (same as user invoked, but force no-docker inside to avoid loop)
+                    inner_cmd = [
+                        "e2e",
+                        operator,
+                        "--target",
+                        target,
+                        "--llm-provider",
+                        llm_provider,
+                        "--mode",
+                        mode,
+                        "--precision",
+                        precision,
+                        "--workspace",
+                        "/workspace",
+                        "--output-dir",
+                        "/workspace/output",
+                    ]
+                    if model:
+                        inner_cmd.extend(["--model", model])
+                    if not use_linux:
+                        inner_cmd.append("--use-semihost")
+                    if output_json:
+                        # Translate output_json to container path if it's inside cwd
+                        try:
+                            out_path = pathlib.Path(output_json).resolve()
+                            cwd = pathlib.Path.cwd().resolve()
+                            if cwd in out_path.parents or out_path.parent == cwd:
+                                rel = out_path.relative_to(cwd)
+                                inner_cmd.extend(["--results", f"/workspace/{rel}"])
+                            else:
+                                inner_cmd.extend(["--results", f"/workspace/{out_path.name}"])
+                        except Exception:
+                            inner_cmd.extend(["--results", str(output_json)])
+                    if spec:
+                        try:
+                            spec_path = pathlib.Path(spec).resolve()
+                            cwd = pathlib.Path.cwd().resolve()
+                            if cwd in spec_path.parents or spec_path.parent == cwd:
+                                rel = spec_path.relative_to(cwd)
+                                inner_cmd.extend(["--spec", f"/workspace/{rel}"])
+                            else:
+                                # Need extra mount for spec outside cwd - add as extra mount
+                                inner_cmd.extend(["--spec", f"/tmp/spec/{spec_path.name}"])
+                        except Exception:
+                            pass
+                    if verbose:
+                        inner_cmd.append("--verbose")
+                    if quiet:
+                        inner_cmd.append("--quiet")
+                    # Always add --no-docker inside to prevent recursion
+                    inner_cmd.append("--no-docker")
+
+                    workspace_host = pathlib.Path.cwd()
+                    # Check for extra mounts needed (spec outside cwd)
+                    extra_mounts = []
+                    if spec:
+                        try:
+                            sp = pathlib.Path(spec).resolve()
+                            cwd = pathlib.Path.cwd().resolve()
+                            if cwd not in sp.parents and sp.parent != cwd:
+                                extra_mounts.append((sp.parent, "/tmp/spec"))
+                        except Exception:
+                            pass
+
+                    docker_cmd = _build_docker_run_cmd(
+                        docker_image=img,
+                        workspace_host=workspace_host,
+                        inner_command=inner_cmd,
+                        extra_mounts=extra_mounts if extra_mounts else None,
+                    )
+                    click.secho("", fg="cyan")
+                    click.secho(
+                        f"Toolchain not found locally → auto-running inside Docker image {img} for smooth UX...",
+                        fg="cyan",
+                        bold=True,
+                    )
+                    click.secho(f"  Host workspace: {workspace_host} -> /workspace", fg="cyan")
+                    click.secho(f"  Docker command: {' '.join(docker_cmd)}", fg="cyan")
+                    click.secho(
+                        "  (Use --no-docker to disable auto-Docker, or --docker-image to specify image)",
+                        fg="cyan",
+                    )
+                    click.secho("", fg="cyan")
+
+                    # Set env to prevent recursion inside container
+                    env = os.environ.copy()
+                    env["KERNELSMITH_INSIDE_DOCKER"] = "1"
+                    try:
+                        result = subprocess.run(docker_cmd, env=env)
+                        sys.exit(result.returncode)
+                    except KeyboardInterrupt:
+                        click.echo("Docker run interrupted", err=True)
+                        sys.exit(130)
+                    except Exception as e:
+                        click.echo(
+                            f"Failed to run in Docker: {e}, falling back to local execution",
+                            err=True,
+                        )
+                        # Continue to local execution fallback
+                else:
+                    if use_docker is True:
+                        # User explicitly forced Docker but no image found
+                        click.secho(
+                            "Docker forced via --docker but no kernelsmith image found. Build one via: docker build -t kernelsmith -f Dockerfile .",
+                            fg="red",
+                            err=True,
+                        )
+                        raise click.Abort()
+
+        if not quiet:
+            click.secho(
+                f"Running Kernelsmith E2E pipeline for {operator} on {target} mode={mode} provider={llm_provider}",
+                fg="cyan",
+                bold=True,
+            )
+            click.echo(
+                f"  Target: {target} | Mode: {mode} | Provider: {llm_provider} | Precision: {precision} | Use Linux: {use_linux}"
+            )
+            click.echo("")
+
+        # Timing overall
+        total_start = time.time()
+
+        # Use harness e2e_pipeline which already has step timing and detailed error messages
+        # But we also add outer step logs for nice CLI
+        from kernelsmith.harness import KernelsmithHarness
+        from kernelsmith.toolchain import (
+            linux_toolchain_available,
+            qemu_available,
+            toolchain_available,
+        )
+
+        # Pre-check toolchain with animated spinner (agentic tool style)
+        tc_check_start = time.time()
+        toolchain_check_ctx = None
+        try:
+            if _has_cli_ui and not quiet:
+                toolchain_check_ctx = cli_ui.AnimatedStep(
+                    "Checking toolchain and QEMU availability",
+                    name="Toolchain & QEMU Check",
+                    total_steps=5,
+                    step_num=1,
+                    quiet=quiet,
+                )
+                toolchain_check_ctx.__enter__()
+            elif not quiet:
+                _log_step_start(1, 5, "Checking toolchain and QEMU availability")
+
+            from kernelsmith.toolchain import resolve_toolchain
+
+            tc = resolve_toolchain(target)
+            has_baremetal = toolchain_available(tc.compiler)
+            has_linux = linux_toolchain_available()
+            has_qemu = qemu_available(tc.qemu_user)
+            if not has_baremetal and not has_linux:
+                if toolchain_check_ctx:
+                    toolchain_check_ctx.failure("No toolchain found")
+                    toolchain_check_ctx.__exit__(None, None, None)
+                _log_failure_block(
+                    "Toolchain Check [1/5]",
+                    context=f"target={target} compiler={tc.compiler} linux=arm-linux-gnueabihf-gcc qemu={tc.qemu_user}",
+                    error="No cross-toolchain found (both baremetal and linux missing)",
+                    suggestions="Install toolchain: apt-get install gcc-arm-none-eabi gcc-arm-linux-gnueabihf qemu-user\n"
+                    "Or use Docker: docker run --rm -v $PWD:/workspace -w /workspace kernelsmith e2e ...",
+                )
+                raise click.Abort()
+            if not has_qemu:
+                if toolchain_check_ctx:
+                    toolchain_check_ctx.failure("QEMU not found")
+                    toolchain_check_ctx.__exit__(None, None, None)
+                _log_failure_block(
+                    "QEMU Check [1/5]",
+                    context=f"qemu={tc.qemu_user}",
+                    error="QEMU binary not found",
+                    suggestions="Install qemu-user: apt-get install qemu-user qemu-system-arm\nOr use Docker image",
+                )
+                raise click.Abort()
+
+            if toolchain_check_ctx:
+                toolchain_check_ctx.success(
+                    f"baremetal={has_baremetal} linux={has_linux} qemu={has_qemu}"
+                )
+                toolchain_check_ctx.__exit__(None, None, None)
+            elif not quiet:
+                _log_step_success(
+                    1,
+                    "Toolchain & QEMU Check",
+                    time.time() - tc_check_start,
+                    f"baremetal={has_baremetal} linux={has_linux} qemu={has_qemu}",
+                )
+        except click.Abort:
+            if toolchain_check_ctx:
+                try:
+                    toolchain_check_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+            raise
+        except Exception as e:
+            if toolchain_check_ctx:
+                try:
+                    toolchain_check_ctx.failure(str(e)[:100])
+                    toolchain_check_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+            if "Aborted" not in str(e):
+                _log_failure_block("Toolchain Check [1/5]", error=str(e))
+            raise click.Abort() from e
+
+        # Now run actual e2e pipeline with animated summary (agentic style) - now with live progress for each sub-step
+        try:
+            h = KernelsmithHarness(target=target, mode=mode, workspace=workspace)
+            h.output_dir = pathlib.Path(output_dir)
+            h.output_dir.mkdir(parents=True, exist_ok=True)
+
+            if not quiet:
+                click.echo("")
+                if _has_cli_ui:
+                    cli_ui.print_e2e_header(
+                        operator, target, mode, llm_provider, precision, use_linux, quiet=quiet
+                    )
+                else:
+                    click.secho(
+                        "Starting E2E Pipeline Steps (detailed logs from harness):", fg="cyan"
+                    )
+                click.echo("")
+
+            # Use live progress for agentic tool style animation
+            live_progress = None
+            progress_callback = None
+            if _has_cli_ui and not quiet:
+                live_progress = cli_ui.E2ELiveProgress(quiet=quiet)
+                live_progress.__enter__()
+                progress_callback = live_progress.callback
+
+            result = h.e2e_pipeline(
+                operator=operator,
+                spec_path=spec,
+                llm_provider=llm_provider,
+                model=model,
+                precision=precision,
+                use_linux=use_linux,
+                output_json=output_json,
+                progress_callback=progress_callback,
+            )
+
+            if live_progress:
+                live_progress.__exit__(None, None, None)
+
+            result_dict = result.to_dict()
+
+            # Print final nice report
+            if not quiet:
+                _print_e2e_success_report(result_dict, verbose=verbose)
+            else:
+                # Quiet mode: just print JSON path and basic status
+                click.echo(f"E2E PASSED for {operator} - results: {result.results_json_path}")
+
+            # Also output JSON path for scripting
+            if output_json:
+                click.echo(f"Combined results JSON: {output_json}")
+            else:
+                click.echo(f"Combined results JSON: {result.results_json_path}")
+
+            total_dur = time.time() - total_start
+            if not quiet:
+                click.secho(f"Total E2E time: {_format_duration(total_dur)}", fg="green")
+
+        except RuntimeError as e:
+            if "live_progress" in locals() and live_progress:
+                try:
+                    live_progress.__exit__(None, None, None)
+                except Exception:
+                    pass
+            err_str = str(e)
+            _log_failure_block(
+                "E2E Pipeline",
+                context=f"operator={operator} target={target} mode={mode} provider={llm_provider} precision={precision}",
+                error=err_str,
+                suggestions="For mock fast path: --llm-provider mock\n"
+                "For real LLM final: set KERNELSMITH_MODEL_API_KEY and use --llm-provider avocado_free\n"
+                "For toolchain issues: use Docker image\n"
+                "Use --verbose for full compiler/QEMU output",
+                artifacts=f"Check build dir: {workspace}/build and output dir: {output_dir}",
+            )
+            raise click.Abort() from e
+        except Exception as e:
+            if "live_progress" in locals() and live_progress:
+                try:
+                    live_progress.__exit__(None, None, None)
+                except Exception:
+                    pass
+            _log_failure_block(
+                "E2E Pipeline (Unexpected)",
+                context=f"operator={operator} target={target} mode={mode} provider={llm_provider}",
+                error=str(e),
+                suggestions="Try --llm-provider mock, --verbose, or check logs",
+            )
+            raise click.Abort() from e
+
+    except click.Abort:
+        raise
+    except Exception as e:
+        _log_failure_block("E2E Command", error=str(e))
         raise click.Abort() from e
 
 

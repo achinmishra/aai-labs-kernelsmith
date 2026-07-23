@@ -27,10 +27,23 @@ dependencies = [
     "pydantic==2.8.2",
     "openai==1.40.2",
     "httpx==0.27.0",
+    "rich==13.9.4",
 ]
 
 [tool.setuptools.package-data]
-kernelsmith = ["operators/*.yaml", "hardware_profiles/*.yaml", "templates/*.txt", "baremetal/*"]
+kernelsmith = [
+    "operators/*.yaml",
+    "hardware_profiles/*.yaml",
+    "templates/*.txt",
+    "templates/*.j2",
+    "taskgen/*.yaml",
+    "taskgen/templates/*.j2",
+    "taskgen/templates/*.txt",
+    "validation/templates/*.j2",
+    "config/*.yaml",
+    "evolution/*.py",
+    "baremetal/*",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -54,12 +67,34 @@ build-backend = "setuptools.build_meta"
 include = ["kernelsmith*"]
 
 [tool.ruff]
-line-length = 100
+line-length = 150
 target-version = "py310"
+exclude = [
+    "work",
+    "results",
+    "build",
+    "build-artifacts",
+    "output",
+    "staging",
+    "logs",
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".conda",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "C4", "UP"]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"kernelsmith/cli.py" = ["E501"]
+"kernelsmith/evolution/*" = ["E501", "B023"]
+"kernelsmith/validation/harness.py" = ["E501"]
+"tests/evolution/*" = ["E501", "B007"]
+"tests/codegen/test_optimize.py" = ["E501"]
+"examples/**/*" = ["S101"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -1,11 +1,12 @@
 """
 Example LLM harness integration for kernelsmith.
-Demonstrates Metacode LLM generating optimized C kernel, compiling per target toolchain,
-emulating under QEMU, collecting metrics for fast vs full trade-off reasoning.
+Demonstrates Metacode LLM generating optimized C kernel, compiling per target
+toolchain, emulating under QEMU, collecting metrics for fast vs full trade-off.
 """
 
-import pathlib
 import json
+import pathlib
+
 from kernelsmith.harness import KernelsmithHarness, run_kernelsmith_pipeline
 
 
@@ -36,16 +37,16 @@ def main():
     fast = comparison["fast"]
     full = comparison["full"]
     print("\nReasoning for LLM harness:")
-    print(
-        f"  Fast mode cycles estimate: {fast['cycles_estimate']}, instructions: {fast['instruction_count']}, time_us: {fast['time_us']}"
-    )
-    print(f"  Full mode cycles estimate: {full['cycles_estimate']}, time_us: {full['time_us']}")
+    print(f"  Fast mode cycles: {fast['cycles_estimate']}, instr: {fast['instruction_count']}, time_us: {fast['time_us']}")
+    print(f"  Full mode cycles: {full['cycles_estimate']}, time_us: {full['time_us']}")
     print(f"  Ratio full/fast: {comparison['comparison']['cycles_ratio']:.2f}")
     print(f"  Text size: {fast['text_bytes']} bytes, total: {fast['total_bytes']} bytes")
     print(f"  Trade-off: {comparison['comparison']['tradeoff_note']}")
 
     print(
-        "\nLLM harness can now reason: fast run gives instruction accuracy for quick iteration, full run gives cycle accuracy with ~15% overhead modeling pipeline stalls. Choose based on latency budget vs accuracy need."
+        "\nLLM harness can now reason: fast run gives instruction accuracy "
+        "for quick iteration, full run gives cycle accuracy with ~15pct "
+        "overhead modeling pipeline stalls. Choose based on latency budget."
     )
 
 
