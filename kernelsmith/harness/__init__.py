@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from kernelsmith.codegen.optimize import optimize as ks_optimize
-from kernelsmith.toolchain import resolve_toolchain, compile_c_to_elf, toolchain_available
+from kernelsmith.toolchain import (
+    resolve_toolchain,
+    compile_c_to_elf,
+    compile_baremetal_system_elf,
+    toolchain_available,
+)
 from kernelsmith.emulator import emulate
 from kernelsmith.metrics import collect_metrics, KernelMetrics
 
@@ -82,12 +87,54 @@ class KernelsmithHarness:
             )
 
         # 3. Compile generated C to ELF
+        # For fast mode we use the simple ELF (size metrics).
+        # For full mode we need a true baremetal system image with startup/linker/semihosting
+        # so that qemu-system-arm -machine mps2-an500 -cpu cortex-m7 can boot it.
         elf_path = self.build_dir / f"{c_path.stem}.elf"
         compile_info = compile_c_to_elf(c_path, elf_path, tc, mode="speed")
 
+        if self.mode == "full":
+            # Build real baremetal system ELF for DWT cycle-accurate emulation
+            system_elf_path = self.build_dir / f"{c_path.stem}_system.elf"
+            try:
+                # Derive func name from header if possible, fallback to generic
+                func_name = None
+                # Try to parse header for ks_* function
+                try:
+                    hdr_text = opt_result.files.header_path.read_text(errors="ignore")
+                    import re
+
+                    m = re.search(r"void\s+(ks_\w+)\s*\(", hdr_text)
+                    if m:
+                        func_name = m.group(1)
+                except Exception:
+                    pass
+                if not func_name:
+                    func_name = f"ks_{operator}_{self.target.replace('-', '_')}"
+                system_compile_info = compile_baremetal_system_elf(
+                    kernel_source=c_path,
+                    output_elf=system_elf_path,
+                    tc=tc,
+                    build_dir=self.build_dir,
+                    func_name=func_name,
+                )
+                # Use system ELF for full emulation, but keep size metrics from simple ELF if needed
+                emu_elf = system_elf_path
+                # Merge compile infos
+                compile_info = {**compile_info, "system": system_compile_info}
+                elf_path_for_metrics = system_elf_path
+            except Exception as e:
+                # If baremetal compile fails, fall back to legacy fast ELF + simulated full
+                emu_elf = elf_path
+                elf_path_for_metrics = elf_path
+                compile_info["system_compile_error"] = str(e)
+        else:
+            emu_elf = elf_path
+            elf_path_for_metrics = elf_path
+
         # 4. Emulate under QEMU
         emu_result = emulate(
-            elf_path,
+            emu_elf,
             mode=self.mode,
             qemu_user=tc.qemu_user,
             qemu_system=tc.qemu_system,
@@ -96,7 +143,7 @@ class KernelsmithHarness:
         )
 
         # 5. Collect metrics
-        metrics = collect_metrics(elf_path, emu_result, self.target)
+        metrics = collect_metrics(elf_path_for_metrics, emu_result, self.target)
 
         # 6. Save results JSON for harness consumption
         result_json = self.results_dir / f"{operator}_{self.target}_{self.mode}.json"

@@ -108,5 +108,9 @@ def compare_fast_vs_full(fast_metrics: KernelMetrics, full_metrics: KernelMetric
         if fast_metrics.time_us
         else None,
         "instr_same": fast_metrics.instruction_count == full_metrics.instruction_count,
-        "tradeoff_note": "fast mode gives instruction-accurate count via qemu-user -d; full mode simulates cycle accuracy with pipeline/cache overhead (~15% simulated). Use fast for iteration speed, full for realistic MCU timing.",
+        "tradeoff_note": (
+            "fast=instruction-accurate via qemu-user -d in_asm (cortex-a15 proxy, no DWT); "
+            "full=real baremetal qemu-system-arm -machine mps2-an500 -cpu cortex-m7 "
+            "semihosting + DWT CYCCNT cycle-accurate measurement"
+        ),
     }

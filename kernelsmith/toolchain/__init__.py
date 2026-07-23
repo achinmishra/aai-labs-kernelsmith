@@ -144,6 +144,30 @@ def get_compile_flags(tc: ToolchainConfig, mode: str = "speed") -> list[str]:
     return [f for f in flags if f]
 
 
+def get_baremetal_compile_flags(tc: ToolchainConfig, mode: str = "speed") -> list[str]:
+    """Flags for true baremetal system image with semihosting (no nosys/nosys fallback)."""
+    opt_map = {"speed": "-O3", "size": "-Os", "debug": "-O0 -g", "default": "-O2"}
+    opt = opt_map.get(mode, "-O2")
+    flags = [
+        tc.arch_flag,
+        tc.thumb_flag,
+        opt,
+        "-g",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-nostartfiles",
+        "-specs=nosys.specs",
+        "-Wl,--gc-sections",
+        "-Wl,-u,_printf_float",  # enable float in printf for harness metrics
+    ]
+    # -nostdlib was too aggressive for semihosting, we want -nostartfiles but keep libc hooks
+    if tc.fpu_flag:
+        flags.append(tc.fpu_flag)
+    if tc.float_abi_flag:
+        flags.append(tc.float_abi_flag)
+    return [f for f in flags if f]
+
+
 def compile_c_to_elf(
     source: pathlib.Path,
     output_elf: pathlib.Path,
@@ -172,4 +196,100 @@ def compile_c_to_elf(
         "stderr": proc.stderr,
         "size": size_output,
         "elf": str(output_elf),
+    }
+
+
+def compile_baremetal_system_elf(
+    kernel_source: pathlib.Path,
+    output_elf: pathlib.Path,
+    tc: ToolchainConfig,
+    build_dir: pathlib.Path,
+    func_name: str | None = None,
+    iters: int = 1000,
+    length: int = 64,
+    mode: str = "speed",
+) -> dict:
+    """
+    Compile a true baremetal QEMU system image:
+      startup_mps2_an500.s + syscalls.c + harness.c + kernel.c -> ELF
+    Uses linker script for mps2-an500 and semihosting syscalls.
+
+    Returns dict with command, size, elf path.
+    """
+    if not toolchain_available(tc.compiler):
+        raise RuntimeError(
+            f"Compiler {tc.compiler} not found in PATH. Ensure Docker image has toolchain."
+        )
+
+    from kernelsmith.baremetal import get_baremetal_sources
+
+    sources = get_baremetal_sources()
+    # Ensure template files exist
+    for k, p in sources.items():
+        if not p.exists():
+            raise RuntimeError(f"Baremetal source missing: {p} ({k})")
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Prepare build dir copies / generated harness with correct func name
+    startup = sources["startup"]
+    syscalls = sources["syscalls"]
+    harness_tmpl = sources["harness"]
+    linker = sources["linker"]
+
+    # Generate harness with func substitution if requested
+    if func_name:
+        harness_src = build_dir / "baremetal_harness.c"
+        tmpl_text = harness_tmpl.read_text()
+        # Replace default macro if user supplied func_name
+        # We inject via -D but also replace placeholder for visibility
+        # Write a wrapper that defines KERNELSMITH_FUNC via macro
+        harness_src.write_text(tmpl_text)
+    else:
+        harness_src = harness_tmpl
+
+    func_define = []
+    if func_name:
+        func_define = [f"-DKERNELSMITH_FUNC={func_name}"]
+    func_define += [f"-DKERNELSMITH_ITERS={iters}", f"-DKERNELSMITH_LEN={length}"]
+
+    flags = get_baremetal_compile_flags(tc, mode)
+    # Link with linker script
+    cmd = [
+        tc.compiler,
+        *flags,
+        *func_define,
+        f"-T{linker}",
+        "-o",
+        str(output_elf),
+        str(startup),
+        str(syscalls),
+        str(harness_src),
+        str(kernel_source),
+        "-lm",
+    ]
+    # Add map
+    cmd += [f"-Wl,-Map,{output_elf.with_suffix('.map')}"]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Baremetal compile failed: {' '.join(cmd)}\nSTDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
+        )
+
+    size_proc = subprocess.run(
+        ["arm-none-eabi-size", str(output_elf)], capture_output=True, text=True
+    )
+    size_output = size_proc.stdout.strip() if size_proc.returncode == 0 else ""
+
+    return {
+        "command": " ".join(cmd),
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "size": size_output,
+        "elf": str(output_elf),
+        "linker": str(linker),
+        "startup": str(startup),
+        "syscalls": str(syscalls),
+        "harness": str(harness_src),
     }

@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [tool.setuptools.package-data]
-kernelsmith = ["operators/*.yaml", "hardware_profiles/*.yaml", "templates/*.txt"]
+kernelsmith = ["operators/*.yaml", "hardware_profiles/*.yaml", "templates/*.txt", "baremetal/*"]
 
 [project.optional-dependencies]
 dev = [

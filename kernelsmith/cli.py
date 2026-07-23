@@ -10,7 +10,12 @@ from kernelsmith.codegen.prompt_builder import (
     list_builtin_targets,
     resolve_hardware_profile,
 )
-from kernelsmith.toolchain import resolve_toolchain, compile_c_to_elf, toolchain_available
+from kernelsmith.toolchain import (
+    resolve_toolchain,
+    compile_c_to_elf,
+    compile_baremetal_system_elf,
+    toolchain_available,
+)
 from kernelsmith.emulator import emulate
 from kernelsmith.metrics import collect_metrics, compare_fast_vs_full
 from kernelsmith.harness import KernelsmithHarness, run_kernelsmith_pipeline
@@ -293,18 +298,59 @@ def benchmark_cmd(
         )
         compile_info = compile_c_to_elf(kernel, elf_path, tc, mode="speed")
         click.echo(f"ELF size info:\n{compile_info['size']}")
+
+        # For full mode, build real baremetal system image with startup/linker/semihosting + DWT
+        if mode == "full":
+            system_elf = build_dir / f"{kernel.stem}_system.elf"
+            try:
+                import re
+
+                # Try to auto-detect func name from kernel source
+                func_name = None
+                try:
+                    txt = kernel.read_text(errors="ignore")
+                    m = re.search(r"void\s+(ks_\w+)\s*\(", txt)
+                    if m:
+                        func_name = m.group(1)
+                except Exception:
+                    pass
+                click.echo(
+                    f"Compiling baremetal system image for {tc.qemu_machine} {tc.qemu_cpu} (func={func_name or 'auto'})..."
+                )
+                sys_info = compile_baremetal_system_elf(
+                    kernel_source=kernel,
+                    output_elf=system_elf,
+                    tc=tc,
+                    build_dir=build_dir,
+                    func_name=func_name,
+                    iters=iterations,
+                )
+                click.echo(f"System ELF size:\n{sys_info['size']}")
+                compile_info = {**compile_info, "system": sys_info}
+                emu_elf = system_elf
+                metrics_elf = system_elf
+            except Exception as e:
+                click.echo(
+                    f"WARN: system ELF build failed ({e}), falling back to simple ELF", err=True
+                )
+                emu_elf = elf_path
+                metrics_elf = elf_path
+        else:
+            emu_elf = elf_path
+            metrics_elf = elf_path
+
         click.echo(
-            f"Emulating under QEMU mode={mode} (user={tc.qemu_user}, system={tc.qemu_system})..."
+            f"Emulating under QEMU mode={mode} (user={tc.qemu_user}, system={tc.qemu_system} machine={tc.qemu_machine} cpu={tc.qemu_cpu})..."
         )
         emu = emulate(
-            elf_path,
+            emu_elf,
             mode=mode,
             qemu_user=tc.qemu_user,
             qemu_system=tc.qemu_system,
             machine=tc.qemu_machine,
             cpu=tc.qemu_cpu,
         )
-        metrics = collect_metrics(elf_path, emu, target_name)
+        metrics = collect_metrics(metrics_elf, emu, target_name)
         out_data = {
             "kernel": str(kernel),
             "target": target_name,
@@ -328,7 +374,7 @@ def benchmark_cmd(
                 "stdout": emu.stdout[:2000],
                 "stderr": emu.stderr[:2000],
             },
-            "tradeoff_note": "fast mode = instruction accurate via qemu-user -d in_asm; full mode = cycle approximate via qemu-system with ~15% simulated overhead for pipeline/cache. Use fast for iteration, full for realistic timing.",
+            "tradeoff_note": "fast mode = instruction accurate via qemu-user -d in_asm (cortex-a15 proxy); full mode = real baremetal qemu-system-arm -machine mps2-an500 -cpu cortex-m7 with semihosting + DWT CYCCNT cycle-accurate. Use fast for iteration speed, full for realistic MCU timing.",
         }
         output.write_text(json.dumps(out_data, indent=2))
         click.echo(f"Benchmark complete. Metrics written to {output}")
